@@ -190,7 +190,11 @@ async function getAvailability(opts = {}) {
   let busy = [];
   try {
     const d = await gfetch('https://www.googleapis.com/calendar/v3/freeBusy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ timeMin: new Date().toISOString(), timeMax: new Date(Date.now() + daysOut * 86400000).toISOString(), timeZone: BUSINESS_TZ, items: [{ id: calId }] }) });
-    busy = (d.calendars && d.calendars[calId] && d.calendars[calId].busy) || [];
+    const cals = d.calendars || {};
+    const key = cals[calId] ? calId : Object.keys(cals)[0];
+    if (key && cals[key] && cals[key].errors) console.error('freebusy cal errors', JSON.stringify(cals[key].errors));
+    busy = (key && cals[key] && cals[key].busy) || [];
+    console.error('freebusy busy count', busy.length, 'key', key, 'calId', calId);
   } catch (e) { console.error('freebusy error', e.message); return { error: 'calendar unavailable' }; }
   const busyMs = busy.map(b => ({ s: new Date(b.start).getTime(), e: new Date(b.end).getTime() + BUFFER_MIN * 60000 }));
   const slots = [];
