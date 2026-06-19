@@ -267,10 +267,8 @@ function brandedEmail(heading, introHtml, rows, footerNote) {
   return `<!doctype html><html><body style="margin:0;padding:0;background:#100e0c">
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#100e0c"><tr><td align="center" style="padding:24px 12px">
     <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#1b1714;border:1px solid rgba(236,224,196,.14);border-radius:16px;overflow:hidden">
-      <tr><td align="center" style="background:#100e0c;padding:26px 20px 18px">
-        <img src="${PUBLIC_URL}/logo.jpg" width="150" alt="The Leaf Busters" style="display:block;border:0;width:150px;max-width:62%;height:auto;margin:0 auto 12px">
-        <div style="color:#ece0c4;font:700 26px/1 'Arial Narrow',Arial,sans-serif;letter-spacing:3px;text-transform:uppercase">The Leaf Busters</div>
-        <div style="color:#d2691e;font:600 12px/1.4 'Arial Narrow',Arial,sans-serif;letter-spacing:3px;text-transform:uppercase;margin-top:6px">Leaf Cleanup &amp; Removal</div>
+      <tr><td align="center" style="background:#100e0c;padding:28px 20px 22px">
+        <img src="${PUBLIC_URL}/logo.jpg" width="190" alt="The Leaf Busters — Leaf Cleanup &amp; Removal" style="display:block;border:0;width:190px;max-width:72%;height:auto;margin:0 auto">
       </td></tr>
       <tr><td style="height:4px;background:#d2691e;font-size:0;line-height:0">&nbsp;</td></tr>
       <tr><td style="padding:26px 30px 4px">
