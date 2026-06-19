@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
+import { google } from 'googleapis';
 
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -98,7 +99,7 @@ app.post('/sms', async (req, res) => {
 // In-memory conversation per session (resets on restart; persistence comes with the dashboard).
 // ---------------------------------------------------------------------------
 const sessions = new Map();
-const WEB_PROMPT = SYSTEM_PROMPT + '\n\nYou are now chatting on the website. Keep replies short and friendly (1-3 sentences). For ANY price, you MUST call the compute_quote tool and use the exact number it returns — never do the pricing math yourself. When the customer wants to book, collect their name, phone, service address, the service, and a preferred day/time, then confirm it back and tell them they will get a confirmation. Never ask them to fill out a form — you handle everything right here in the chat.';
+const WEB_PROMPT = SYSTEM_PROMPT + '\n\nYou are now chatting on the website. Keep replies short and friendly (1-3 sentences). For ANY price, you MUST call the compute_quote tool and use the exact number it returns — never do the pricing math yourself. When the customer is ready to book: call check_availability to get real open windows and offer a couple of them; once they pick one and you have their name, phone, and service address, call book_job to lock it in, then confirm the day/time and price back to them. If they share contact info but are not ready to book, call save_lead so we can follow up. Never ask them to fill out a form — you handle everything right here in the chat.';
 
 // Deterministic pricing engine. The AI calls this via the compute_quote tool so every quote is exact.
 function computeQuote({ yard_size, acres, leaf_load = 'average', brush = 'none', gutters = 'none', extra_trucks = 0, discount = 'none' }) {
@@ -116,26 +117,143 @@ function computeQuote({ yard_size, acres, leaf_load = 'average', brush = 'none',
   return { price, type: isEstimate ? 'estimate' : 'firm', inputs: { yard_size, acres, leaf_load, brush, gutters, extra_trucks, discount } };
 }
 
-const TOOLS = [{
-  type: 'function',
-  function: {
-    name: 'compute_quote',
-    description: 'Calculate the exact price for a leaf/yard cleanup. Call this whenever you quote a price. Always use the returned price; never do the math yourself. The result includes "type": "firm" (give it as a firm price) or "estimate" (give it but say you will confirm from 2 photos).',
-    parameters: {
-      type: 'object',
-      properties: {
-        yard_size: { type: 'string', enum: ['small', 'medium', 'large', 'acreage'], description: 'small = city lot under 1/4 acre; medium = 1/4-1/2 acre; large = 1/2-1 acre; acreage = 1+ acre' },
-        acres: { type: 'number', description: 'number of acres, only when yard_size is acreage' },
-        leaf_load: { type: 'string', enum: ['light', 'average', 'heavy'], description: 'light = few trees/thin scatter; average = typical fall; heavy = thick layer/many trees/late season' },
-        brush: { type: 'string', enum: ['none', 'light', 'moderate', 'heavy'], description: 'separate brush & debris removal amount' },
-        gutters: { type: 'string', enum: ['none', 'single', 'two'], description: 'gutter cleaning: single-story or two-story' },
-        extra_trucks: { type: 'integer', description: 'extra truckloads of hauling beyond the first' },
-        discount: { type: 'string', enum: ['none', 'seasonal', 'returning', 'neighbor'], description: 'apply at most one discount if it genuinely fits' }
-      },
-      required: ['yard_size', 'leaf_load']
+// ---- Google (Calendar + Sheets) via service account ----
+const BUSINESS_TZ = process.env.BUSINESS_TZ || 'America/Chicago';
+let _gauth = null;
+function googleAuth() {
+  if (_gauth) return _gauth;
+  if (!process.env.GOOGLE_SERVICE_ACCOUNT_JSON) return null;
+  try {
+    const creds = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+    _gauth = new google.auth.JWT(creds.client_email, null, creds.private_key,
+      ['https://www.googleapis.com/auth/calendar', 'https://www.googleapis.com/auth/spreadsheets']);
+  } catch (e) { console.error('Bad GOOGLE_SERVICE_ACCOUNT_JSON:', e.message); return null; }
+  return _gauth;
+}
+function ymd(daysAhead) { return new Date(Date.now() + daysAhead * 86400000).toLocaleDateString('en-CA', { timeZone: BUSINESS_TZ }); }
+function weekday(ymdStr) { return new Date(ymdStr + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' }); }
+function wallToUtc(ymdStr, hour) {
+  const naive = new Date(`${ymdStr}T${String(hour).padStart(2, '0')}:00:00Z`);
+  const offset = new Date(naive.toLocaleString('en-US', { timeZone: 'UTC' })) - new Date(naive.toLocaleString('en-US', { timeZone: BUSINESS_TZ }));
+  return new Date(naive.getTime() + offset);
+}
+
+async function getAvailability(daysOut = 12, maxSlots = 6) {
+  const auth = googleAuth(); if (!auth) return { error: 'calendar not configured' };
+  const cal = google.calendar({ version: 'v3', auth });
+  const calId = process.env.GOOGLE_CALENDAR_ID;
+  let busy = [];
+  try {
+    const fb = await cal.freebusy.query({ requestBody: { timeMin: new Date().toISOString(), timeMax: new Date(Date.now() + daysOut * 86400000).toISOString(), timeZone: BUSINESS_TZ, items: [{ id: calId }] } });
+    busy = (fb.data.calendars[calId] && fb.data.calendars[calId].busy) || [];
+  } catch (e) { console.error('freebusy error', e.message); }
+  const windows = [{ label: 'morning', hour: 9, end: 12 }, { label: 'afternoon', hour: 13, end: 16 }];
+  const slots = [];
+  for (let d = 1; d <= daysOut && slots.length < maxSlots; d++) {
+    const day = ymd(d), wd = weekday(day);
+    if (wd === 'Sunday') continue;
+    for (const w of windows) {
+      if (slots.length >= maxSlots) break;
+      const start = wallToUtc(day, w.hour), end = wallToUtc(day, w.end);
+      if (start < new Date()) continue;
+      if (!busy.some(b => new Date(b.start) < end && new Date(b.end) > start))
+        slots.push({ label: `${wd} ${w.label} (${day})`, start_iso: start.toISOString(), window: w.label });
     }
   }
-}];
+  return { slots };
+}
+
+async function appendLead(d = {}) {
+  const auth = googleAuth(); if (!auth) return { error: 'sheet not configured' };
+  const sheets = google.sheets({ version: 'v4', auth });
+  const ts = new Date().toLocaleString('en-US', { timeZone: BUSINESS_TZ });
+  try {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID, range: 'A1', valueInputOption: 'USER_ENTERED',
+      requestBody: { values: [[ts, d.name || '', d.phone || '', d.address || '', d.service || '', d.yard_size || '', d.leaf_load || '', d.quote || '', d.type || '', d.status || 'New', d.source || 'Web chat', d.notes || '']] }
+    });
+  } catch (e) { console.error('append lead error', e.message); return { error: 'could not save' }; }
+  return { saved: true };
+}
+
+async function bookJob(a = {}) {
+  const auth = googleAuth(); if (!auth) return { error: 'calendar not configured' };
+  const cal = google.calendar({ version: 'v3', auth });
+  const start = new Date(a.start_iso), end = new Date(start.getTime() + 3 * 3600 * 1000);
+  let when = start.toLocaleString('en-US', { timeZone: BUSINESS_TZ, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  try {
+    await cal.events.insert({
+      calendarId: process.env.GOOGLE_CALENDAR_ID,
+      requestBody: {
+        summary: `Leaf cleanup — ${a.name || 'Customer'}`,
+        description: `Service: ${a.service || ''}\nQuote: ${a.quote || ''}\nPhone: ${a.phone || ''}\nNotes: ${a.notes || ''}`,
+        location: a.address || '',
+        start: { dateTime: start.toISOString(), timeZone: BUSINESS_TZ },
+        end: { dateTime: end.toISOString(), timeZone: BUSINESS_TZ }
+      }
+    });
+  } catch (e) { console.error('book error', e.message); return { error: 'could not book' }; }
+  await appendLead({ ...a, status: 'Booked', notes: `${a.notes || ''} | booked ${when}` });
+  return { booked: true, when };
+}
+
+const TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'compute_quote',
+      description: 'Calculate the exact price for a leaf/yard cleanup. Call this whenever you quote a price. Always use the returned price; never do the math yourself. Result includes "type": "firm" or "estimate".',
+      parameters: {
+        type: 'object',
+        properties: {
+          yard_size: { type: 'string', enum: ['small', 'medium', 'large', 'acreage'], description: 'small = city lot under 1/4 acre; medium = 1/4-1/2 acre; large = 1/2-1 acre; acreage = 1+ acre' },
+          acres: { type: 'number', description: 'number of acres, only when yard_size is acreage' },
+          leaf_load: { type: 'string', enum: ['light', 'average', 'heavy'], description: 'light = few trees/thin; average = typical; heavy = thick/many trees/late season' },
+          brush: { type: 'string', enum: ['none', 'light', 'moderate', 'heavy'] },
+          gutters: { type: 'string', enum: ['none', 'single', 'two'] },
+          extra_trucks: { type: 'integer' },
+          discount: { type: 'string', enum: ['none', 'seasonal', 'returning', 'neighbor'] }
+        },
+        required: ['yard_size', 'leaf_load']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: { name: 'check_availability', description: 'Get real open appointment windows from the calendar. Call before offering times. Returns a list of slots with a label and start_iso.', parameters: { type: 'object', properties: {} } }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'book_job',
+      description: 'Book a cleanup on the calendar and log the customer. Only call once you have a chosen slot (start_iso from check_availability) plus the customer name, phone, and address.',
+      parameters: {
+        type: 'object',
+        properties: {
+          start_iso: { type: 'string', description: 'start_iso from a check_availability slot' },
+          name: { type: 'string' }, phone: { type: 'string' }, address: { type: 'string' },
+          service: { type: 'string' }, quote: { type: 'string', description: 'quoted price, e.g. $270' }, notes: { type: 'string' }
+        },
+        required: ['start_iso', 'name', 'phone', 'address']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'save_lead',
+      description: 'Save a lead when the customer shares contact info but is not booking yet, so we can follow up.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string' }, phone: { type: 'string' }, address: { type: 'string' },
+          service: { type: 'string' }, yard_size: { type: 'string' }, leaf_load: { type: 'string' },
+          quote: { type: 'string' }, type: { type: 'string' }, notes: { type: 'string' }
+        }
+      }
+    }
+  }
+];
 
 // CORS for the chat endpoint so the website (different origin) can call it.
 app.use('/chat', (req, res, next) => {
@@ -171,8 +289,12 @@ app.post('/chat', async (req, res) => {
           let result = {};
           try {
             const args = JSON.parse(tc.function.arguments || '{}');
-            if (tc.function.name === 'compute_quote') result = computeQuote(args);
-          } catch (err) { result = { error: 'could not compute' }; }
+            const fn = tc.function.name;
+            if (fn === 'compute_quote') result = computeQuote(args);
+            else if (fn === 'check_availability') result = await getAvailability();
+            else if (fn === 'book_job') result = await bookJob({ ...args, source: 'Web chat' });
+            else if (fn === 'save_lead') result = await appendLead({ ...args, source: 'Web chat' });
+          } catch (err) { result = { error: 'tool failed' }; }
           history.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(result) });
         }
         continue;
@@ -186,6 +308,64 @@ app.post('/chat', async (req, res) => {
   if (history.length > 30) history = [history[0], ...history.slice(-28)];
   sessions.set(id, history);
   res.json({ reply });
+});
+
+// ---------------------------------------------------------------------------
+// Dashboard — password protected (basic auth with DASHBOARD_PASSWORD).
+// Shows upcoming bookings (calendar) + all leads (sheet).
+// ---------------------------------------------------------------------------
+function dashAuth(req, res, next) {
+  const pw = process.env.DASHBOARD_PASSWORD;
+  if (!pw) return res.status(503).send('Set DASHBOARD_PASSWORD in Render to enable the dashboard.');
+  const m = (req.headers.authorization || '').match(/^Basic (.+)$/);
+  if (m) { const parts = Buffer.from(m[1], 'base64').toString().split(':'); if (parts[1] === pw) return next(); }
+  res.set('WWW-Authenticate', 'Basic realm="Leaf Busters Dashboard"').status(401).send('Authentication required.');
+}
+
+function esc(s = '') { return String(s).replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c])); }
+
+function renderDashboard(leads, events) {
+  const header = leads.length ? leads[0] : ['Timestamp', 'Name', 'Phone', 'Address', 'Service', 'Yard size', 'Leaf load', 'Quote', 'Type', 'Status', 'Source', 'Notes'];
+  const rows = leads.slice(1).reverse();
+  const evRows = events.map(e => {
+    const s = e.start && (e.start.dateTime || e.start.date);
+    const when = s ? new Date(s).toLocaleString('en-US', { timeZone: BUSINESS_TZ, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '';
+    return `<tr><td>${esc(when)}</td><td>${esc(e.summary || '')}</td><td>${esc(e.location || '')}</td><td>${esc((e.description || '').replace(/\n/g, ' • '))}</td></tr>`;
+  }).join('');
+  const leadRows = rows.map(r => `<tr>${header.map((_, i) => `<td>${esc(r[i] || '')}</td>`).join('')}</tr>`).join('');
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Leaf Busters Dashboard</title>
+<style>body{font-family:system-ui,Arial,sans-serif;background:#100e0c;color:#f4eee0;margin:0;padding:24px}
+h1{font-size:22px;color:#ec7a1e;margin:0 0 4px}h2{font-size:17px;color:#ece0c4;margin:28px 0 10px}
+.sub{color:#c9b896;font-size:13px;margin-bottom:8px}
+table{width:100%;border-collapse:collapse;font-size:13px;background:#1b1714;border-radius:10px;overflow:hidden}
+th,td{padding:9px 11px;text-align:left;border-bottom:1px solid rgba(236,224,196,.12);vertical-align:top}
+th{background:#2f5233;color:#f3ede0;font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+tr:hover td{background:rgba(210,105,30,.06)}.empty{color:#c9b896;padding:14px 0}
+.count{background:#d2691e;color:#fff7ec;border-radius:20px;padding:1px 9px;font-size:13px;margin-left:6px}</style></head>
+<body><h1>The Leaf Busters — Dashboard</h1><div class="sub">Live from your calendar &amp; leads sheet. Reload to refresh.</div>
+<h2>Upcoming bookings <span class="count">${events.length}</span></h2>
+${events.length ? `<table><tr><th>When</th><th>Job</th><th>Address</th><th>Details</th></tr>${evRows}</table>` : '<div class="empty">No upcoming bookings yet.</div>'}
+<h2>Leads &amp; quotes <span class="count">${rows.length}</span></h2>
+${rows.length ? `<table><tr>${header.map(h => `<th>${esc(h)}</th>`).join('')}</tr>${leadRows}</table>` : '<div class="empty">No leads captured yet.</div>'}
+</body></html>`;
+}
+
+app.get('/dashboard', dashAuth, async (req, res) => {
+  let leads = [], events = [];
+  const auth = googleAuth();
+  if (auth) {
+    try {
+      const sheets = google.sheets({ version: 'v4', auth });
+      const r = await sheets.spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: 'A1:L2000' });
+      leads = r.data.values || [];
+    } catch (e) { console.error('dash sheet', e.message); }
+    try {
+      const cal = google.calendar({ version: 'v3', auth });
+      const ev = await cal.events.list({ calendarId: process.env.GOOGLE_CALENDAR_ID, timeMin: new Date().toISOString(), maxResults: 50, singleEvents: true, orderBy: 'startTime' });
+      events = ev.data.items || [];
+    } catch (e) { console.error('dash cal', e.message); }
+  }
+  res.send(renderDashboard(leads, events));
 });
 
 // ---------------------------------------------------------------------------
