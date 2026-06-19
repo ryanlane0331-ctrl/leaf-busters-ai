@@ -52,6 +52,12 @@ app.get('/', (req, res) => {
   res.send('The Leaf Busters AI assistant is running.');
 });
 
+// Non-secret diagnostic: which service account + calendar the server uses.
+app.get('/whoami', (req, res) => {
+  const c = getCreds();
+  res.json({ service_account: (c && c.client_email) || null, calendar_id: process.env.GOOGLE_CALENDAR_ID || null, sheet_id_set: !!process.env.GOOGLE_SHEET_ID });
+});
+
 function escapeXml(s = '') {
   return s.replace(/[<>&'"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' }[c]));
 }
