@@ -6,7 +6,7 @@ import crypto from 'crypto';
 
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview-2024-12-17';
+const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime';
 const VOICE = process.env.OPENAI_VOICE || 'verse';
 const SMS_MODEL = process.env.OPENAI_SMS_MODEL || 'gpt-4o-mini';
 
@@ -410,37 +410,35 @@ wss.on('connection', (twilioWs) => {
   let streamSid = null;
 
   const openaiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`, {
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' }
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }
   });
 
   openaiWs.on('open', () => {
-    openaiWs.send(JSON.stringify({
-      type: 'session.update',
-      session: {
-        turn_detection: { type: 'server_vad' },
-        input_audio_format: 'g711_ulaw',
-        output_audio_format: 'g711_ulaw',
-        voice: VOICE,
-        instructions: VOICE_PROMPT,
-        modalities: ['text', 'audio'],
-        temperature: 0.8,
-        tools: REALTIME_TOOLS,
-        tool_choice: 'auto'
-      }
-    }));
-    // Ask the assistant to greet the caller first.
     setTimeout(() => {
       openaiWs.send(JSON.stringify({
-        type: 'response.create',
-        response: { instructions: 'Greet the caller now using your opening line.' }
+        type: 'session.update',
+        session: {
+          type: 'realtime',
+          model: REALTIME_MODEL,
+          output_modalities: ['audio'],
+          audio: {
+            input: { format: { type: 'audio/pcmu' }, turn_detection: { type: 'server_vad' } },
+            output: { format: { type: 'audio/pcmu' }, voice: VOICE }
+          },
+          instructions: VOICE_PROMPT,
+          tools: REALTIME_TOOLS,
+          tool_choice: 'auto'
+        }
       }));
-    }, 300);
+      // Greet the caller first.
+      setTimeout(() => openaiWs.send(JSON.stringify({ type: 'response.create' })), 300);
+    }, 250);
   });
 
   openaiWs.on('message', async (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
-    if (msg.type === 'response.audio.delta' && msg.delta && streamSid) {
+    if (msg.type === 'response.output_audio.delta' && msg.delta && streamSid) {
       twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: msg.delta } }));
     } else if (msg.type === 'input_audio_buffer.speech_started' && streamSid) {
       // Caller started talking — stop our current playback so we don't talk over them.
