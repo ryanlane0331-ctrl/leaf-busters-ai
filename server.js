@@ -128,6 +128,8 @@ app.post('/chat', async (req, res) => {
     if (data?.choices?.[0]?.message?.content) {
       reply = data.choices[0].message.content.trim();
       history.push({ role: 'assistant', content: reply });
+    } else {
+      console.error('OpenAI chat no choices. HTTP', r.status, JSON.stringify(data).slice(0, 400));
     }
   } catch (e) {
     console.error('Chat error:', e.message);
