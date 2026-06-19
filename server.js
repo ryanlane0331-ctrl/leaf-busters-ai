@@ -422,7 +422,7 @@ wss.on('connection', (twilioWs) => {
           model: REALTIME_MODEL,
           output_modalities: ['audio'],
           audio: {
-            input: { format: { type: 'audio/pcmu' }, turn_detection: { type: 'server_vad' } },
+            input: { format: { type: 'audio/pcmu' }, turn_detection: { type: 'server_vad', threshold: 0.65, prefix_padding_ms: 300, silence_duration_ms: 700 } },
             output: { format: { type: 'audio/pcmu' }, voice: VOICE }
           },
           instructions: VOICE_PROMPT,
