@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
-import { google } from 'googleapis';
+import crypto from 'crypto';
 
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -117,18 +117,48 @@ function computeQuote({ yard_size, acres, leaf_load = 'average', brush = 'none',
   return { price, type: isEstimate ? 'estimate' : 'firm', inputs: { yard_size, acres, leaf_load, brush, gutters, extra_trucks, discount } };
 }
 
-// ---- Google (Calendar + Sheets) via service account ----
+// ---- Google (Calendar + Sheets) via service account: direct REST + self-signed JWT ----
 const BUSINESS_TZ = process.env.BUSINESS_TZ || 'America/Chicago';
-let _gauth = null;
-function googleAuth() {
-  if (_gauth) return _gauth;
-  if (!process.env.GOOGLE_SERVICE_ACCOUNT_JSON) return null;
-  try {
-    const creds = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
-    _gauth = new google.auth.JWT(creds.client_email, null, creds.private_key,
-      ['https://www.googleapis.com/auth/calendar', 'https://www.googleapis.com/auth/spreadsheets']);
-  } catch (e) { console.error('Bad GOOGLE_SERVICE_ACCOUNT_JSON:', e.message); return null; }
-  return _gauth;
+let _creds = null;
+function getCreds() {
+  if (_creds !== null) return _creds || null;
+  let raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  if (!raw) { _creds = false; return null; }
+  raw = raw.trim();
+  try { if (!raw.startsWith('{')) raw = Buffer.from(raw, 'base64').toString('utf8'); _creds = JSON.parse(raw); }
+  catch (e) { console.error('Bad GOOGLE_SERVICE_ACCOUNT_JSON:', e.message); _creds = false; return null; }
+  return _creds;
+}
+function b64url(x) { return Buffer.from(x).toString('base64').replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_'); }
+let _tok = null, _tokExp = 0;
+async function getToken() {
+  if (_tok && Date.now() < _tokExp) return _tok;
+  const c = getCreds(); if (!c) return null;
+  const now = Math.floor(Date.now() / 1000);
+  const head = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const claim = b64url(JSON.stringify({ iss: c.client_email, scope: 'https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/spreadsheets', aud: 'https://oauth2.googleapis.com/token', exp: now + 3600, iat: now }));
+  const sig = b64url(crypto.createSign('RSA-SHA256').update(`${head}.${claim}`).sign(c.private_key));
+  const assertion = `${head}.${claim}.${sig}`;
+  for (let i = 0; i < 3; i++) {
+    try {
+      const r = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion }) });
+      const d = await r.json();
+      if (d.access_token) { _tok = d.access_token; _tokExp = Date.now() + (d.expires_in - 120) * 1000; return _tok; }
+      console.error('token error', JSON.stringify(d).slice(0, 200)); return null;
+    } catch (e) { if (i === 2) { console.error('token fetch failed', e.message); return null; } await new Promise(s => setTimeout(s, 500)); }
+  }
+  return null;
+}
+async function gfetch(url, opts = {}) {
+  const tok = await getToken(); if (!tok) throw new Error('no google token');
+  let lastErr;
+  for (let i = 0; i < 3; i++) {
+    try {
+      const r = await fetch(url, { ...opts, headers: { ...(opts.headers || {}), Authorization: `Bearer ${tok}` } });
+      return await r.json();
+    } catch (e) { lastErr = e; await new Promise(s => setTimeout(s, 500)); }
+  }
+  throw lastErr;
 }
 function ymd(daysAhead) { return new Date(Date.now() + daysAhead * 86400000).toLocaleDateString('en-CA', { timeZone: BUSINESS_TZ }); }
 function weekday(ymdStr) { return new Date(ymdStr + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' }); }
@@ -139,18 +169,17 @@ function wallToUtc(ymdStr, hour) {
 }
 
 async function getAvailability(daysOut = 12, maxSlots = 6) {
-  const auth = googleAuth(); if (!auth) return { error: 'calendar not configured' };
-  const cal = google.calendar({ version: 'v3', auth });
+  if (!getCreds()) return { error: 'calendar not configured' };
   const calId = process.env.GOOGLE_CALENDAR_ID;
   let busy = [];
   try {
-    const fb = await cal.freebusy.query({ requestBody: { timeMin: new Date().toISOString(), timeMax: new Date(Date.now() + daysOut * 86400000).toISOString(), timeZone: BUSINESS_TZ, items: [{ id: calId }] } });
-    busy = (fb.data.calendars[calId] && fb.data.calendars[calId].busy) || [];
-  } catch (e) { console.error('freebusy error', e.message); }
+    const d = await gfetch('https://www.googleapis.com/calendar/v3/freeBusy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ timeMin: new Date().toISOString(), timeMax: new Date(Date.now() + daysOut * 86400000).toISOString(), timeZone: BUSINESS_TZ, items: [{ id: calId }] }) });
+    busy = (d.calendars && d.calendars[calId] && d.calendars[calId].busy) || [];
+  } catch (e) { console.error('freebusy error', e.message); return { error: 'calendar unavailable' }; }
   const windows = [{ label: 'morning', hour: 9, end: 12 }, { label: 'afternoon', hour: 13, end: 16 }];
   const slots = [];
-  for (let d = 1; d <= daysOut && slots.length < maxSlots; d++) {
-    const day = ymd(d), wd = weekday(day);
+  for (let dd = 1; dd <= daysOut && slots.length < maxSlots; dd++) {
+    const day = ymd(dd), wd = weekday(day);
     if (wd === 'Sunday') continue;
     for (const w of windows) {
       if (slots.length >= maxSlots) break;
@@ -164,34 +193,22 @@ async function getAvailability(daysOut = 12, maxSlots = 6) {
 }
 
 async function appendLead(d = {}) {
-  const auth = googleAuth(); if (!auth) return { error: 'sheet not configured' };
-  const sheets = google.sheets({ version: 'v4', auth });
+  if (!getCreds()) return { error: 'sheet not configured' };
+  const id = encodeURIComponent(process.env.GOOGLE_SHEET_ID);
   const ts = new Date().toLocaleString('en-US', { timeZone: BUSINESS_TZ });
   try {
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: process.env.GOOGLE_SHEET_ID, range: 'A1', valueInputOption: 'USER_ENTERED',
-      requestBody: { values: [[ts, d.name || '', d.phone || '', d.address || '', d.service || '', d.yard_size || '', d.leaf_load || '', d.quote || '', d.type || '', d.status || 'New', d.source || 'Web chat', d.notes || '']] }
-    });
+    await gfetch(`https://sheets.googleapis.com/v4/spreadsheets/${id}/values/A1:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: [[ts, d.name || '', d.phone || '', d.address || '', d.service || '', d.yard_size || '', d.leaf_load || '', d.quote || '', d.type || '', d.status || 'New', d.source || 'Web chat', d.notes || '']] }) });
   } catch (e) { console.error('append lead error', e.message); return { error: 'could not save' }; }
   return { saved: true };
 }
 
 async function bookJob(a = {}) {
-  const auth = googleAuth(); if (!auth) return { error: 'calendar not configured' };
-  const cal = google.calendar({ version: 'v3', auth });
+  if (!getCreds()) return { error: 'calendar not configured' };
+  const id = encodeURIComponent(process.env.GOOGLE_CALENDAR_ID);
   const start = new Date(a.start_iso), end = new Date(start.getTime() + 3 * 3600 * 1000);
-  let when = start.toLocaleString('en-US', { timeZone: BUSINESS_TZ, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  const when = start.toLocaleString('en-US', { timeZone: BUSINESS_TZ, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
   try {
-    await cal.events.insert({
-      calendarId: process.env.GOOGLE_CALENDAR_ID,
-      requestBody: {
-        summary: `Leaf cleanup — ${a.name || 'Customer'}`,
-        description: `Service: ${a.service || ''}\nQuote: ${a.quote || ''}\nPhone: ${a.phone || ''}\nNotes: ${a.notes || ''}`,
-        location: a.address || '',
-        start: { dateTime: start.toISOString(), timeZone: BUSINESS_TZ },
-        end: { dateTime: end.toISOString(), timeZone: BUSINESS_TZ }
-      }
-    });
+    await gfetch(`https://www.googleapis.com/calendar/v3/calendars/${id}/events`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ summary: `Leaf cleanup — ${a.name || 'Customer'}`, description: `Service: ${a.service || ''}\nQuote: ${a.quote || ''}\nPhone: ${a.phone || ''}\nNotes: ${a.notes || ''}`, location: a.address || '', start: { dateTime: start.toISOString(), timeZone: BUSINESS_TZ }, end: { dateTime: end.toISOString(), timeZone: BUSINESS_TZ } }) });
   } catch (e) { console.error('book error', e.message); return { error: 'could not book' }; }
   await appendLead({ ...a, status: 'Booked', notes: `${a.notes || ''} | booked ${when}` });
   return { booked: true, when };
@@ -352,17 +369,14 @@ ${rows.length ? `<table><tr>${header.map(h => `<th>${esc(h)}</th>`).join('')}</t
 
 app.get('/dashboard', dashAuth, async (req, res) => {
   let leads = [], events = [];
-  const auth = googleAuth();
-  if (auth) {
+  if (getCreds()) {
     try {
-      const sheets = google.sheets({ version: 'v4', auth });
-      const r = await sheets.spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: 'A1:L2000' });
-      leads = r.data.values || [];
+      const d = await gfetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(process.env.GOOGLE_SHEET_ID)}/values/A1:L2000`);
+      leads = d.values || [];
     } catch (e) { console.error('dash sheet', e.message); }
     try {
-      const cal = google.calendar({ version: 'v3', auth });
-      const ev = await cal.events.list({ calendarId: process.env.GOOGLE_CALENDAR_ID, timeMin: new Date().toISOString(), maxResults: 50, singleEvents: true, orderBy: 'startTime' });
-      events = ev.data.items || [];
+      const d = await gfetch(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(process.env.GOOGLE_CALENDAR_ID)}/events?timeMin=${encodeURIComponent(new Date().toISOString())}&maxResults=50&singleEvents=true&orderBy=startTime`);
+      events = d.items || [];
     } catch (e) { console.error('dash cal', e.message); }
   }
   res.send(renderDashboard(leads, events));
