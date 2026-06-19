@@ -34,7 +34,7 @@ HOW TO QUOTE — follow this exactly and do the math yourself:
 5) Round to the nearest $5. Never quote below $99.
 Give a FIRM price for Small or Medium yards with Light or Average leaf load. For Large or Acreage yards, Heavy load, two-story gutters, or anything you can't pin down, give it as an ESTIMATE and say you'll confirm the exact price from two quick photos texted to this number.
 
-TO BOOK A JOB: collect the caller's name, phone number, and service address, and which service they want. Offer the next couple of openings as windows (like "tomorrow morning" or "Thursday afternoon"), never an exact minute. Confirm the price, date, and address back to them. Tell them they'll get a text confirmation and that payment is due when the job is done. Reschedule weather days for free.
+TO BOOK A JOB: collect the caller's name, phone number, and service address, and which service they want. Offer the next couple of openings as windows (like "tomorrow morning" or "Thursday afternoon"), never an exact minute. Confirm the price, date, and address back to them. Ask for their email so we can send a confirmation; never say "text". Tell them payment is due when the job is done. Reschedule weather days for free.
 
 RULES: Be truthful about the pricing above — never invent services or prices. Never share other customers' information. If someone has a complaint or something you truly cannot handle, take their details and say the owner will follow up. Keep it friendly and get them booked.
 
@@ -102,7 +102,7 @@ app.post('/sms', async (req, res) => {
 // In-memory conversation per session (resets on restart; persistence comes with the dashboard).
 // ---------------------------------------------------------------------------
 const sessions = new Map();
-const WEB_PROMPT = SYSTEM_PROMPT + '\n\nYou are now chatting on the website. Keep replies short and friendly (1-3 sentences). For ANY price, you MUST call the compute_quote tool and use the exact number it returns — never do the pricing math yourself. When the customer is ready to book: call check_availability to get real open windows and offer a couple of them; once they pick one and you have their name, phone, and service address, call book_job to lock it in, then confirm the day/time and price back to them. If they share contact info but are not ready to book, call save_lead so we can follow up. Never ask them to fill out a form — you handle everything right here in the chat. If the customer sends a photo of their yard, look at it to judge the yard size and leaf load, then call compute_quote. When a customer gives a phone number or a name, call lookup_customer — if they are a returning customer, greet them by name and apply the returning-customer discount. When booking, also ask for the customer\'s email so we can send a confirmation, and pass it to book_job.';
+const WEB_PROMPT = SYSTEM_PROMPT + '\n\nYou are now chatting on the website. Keep replies short and friendly (1-3 sentences). For ANY price, you MUST call the compute_quote tool and use the exact number it returns — never do the pricing math yourself. When the customer is ready to book: call check_availability (always pass the yard_size and leaf_load you used for the quote so the offered times are long enough for the job) and offer a couple of the returned times; once they pick one and you have their name, phone, and service address, call book_job (also pass yard_size and leaf_load) to lock it in, then confirm the day/time and price back to them. If they share contact info but are not ready to book, call save_lead so we can follow up. Never ask them to fill out a form — you handle everything right here in the chat. If the customer sends a photo of their yard, look at it to judge the yard size and leaf load, then call compute_quote. When a customer gives a phone number or a name, call lookup_customer — if they are a returning customer, greet them by name and apply the returning-customer discount. When booking, also ask for the customer\'s email so we can send a confirmation, and pass it to book_job.';
 
 // Deterministic pricing engine. The AI calls this via the compute_quote tool so every quote is exact.
 function computeQuote({ yard_size, acres, leaf_load = 'average', brush = 'none', gutters = 'none', extra_trucks = 0, discount = 'none' }) {
@@ -165,34 +165,50 @@ async function gfetch(url, opts = {}) {
 }
 function ymd(daysAhead) { return new Date(Date.now() + daysAhead * 86400000).toLocaleDateString('en-CA', { timeZone: BUSINESS_TZ }); }
 function weekday(ymdStr) { return new Date(ymdStr + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' }); }
-function wallToUtc(ymdStr, hour) {
-  const naive = new Date(`${ymdStr}T${String(hour).padStart(2, '0')}:00:00Z`);
+function wallToUtc(ymdStr, hour, minute = 0) {
+  const naive = new Date(`${ymdStr}T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00Z`);
   const offset = new Date(naive.toLocaleString('en-US', { timeZone: 'UTC' })) - new Date(naive.toLocaleString('en-US', { timeZone: BUSINESS_TZ }));
   return new Date(naive.getTime() + offset);
 }
 
-async function getAvailability(daysOut = 12, maxSlots = 6) {
+// Estimated on-site work time (minutes) from yard size + leaf load.
+function estimateMinutes({ yard_size = 'medium', leaf_load = 'average', acres } = {}) {
+  let base = ({ small: 60, medium: 120, large: 210, acreage: 300 })[yard_size] ?? 120;
+  if (yard_size === 'acreage' && acres && acres > 1) base = 300 + 120 * (Math.ceil(acres) - 1);
+  const mult = ({ light: 0.85, average: 1, heavy: 1.3 })[leaf_load] ?? 1;
+  return Math.max(45, Math.round((base * mult) / 15) * 15);
+}
+
+const BUFFER_MIN = 60;            // gap after each job: hauling, refuel, travel
+const DAY_START = 8, DAY_END = 17; // working hours 8am-5pm
+
+async function getAvailability(opts = {}) {
   if (!getCreds()) return { error: 'calendar not configured' };
   const calId = process.env.GOOGLE_CALENDAR_ID;
+  const daysOut = 14, maxSlots = 6;
+  const estimate = estimateMinutes(opts);
   let busy = [];
   try {
     const d = await gfetch('https://www.googleapis.com/calendar/v3/freeBusy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ timeMin: new Date().toISOString(), timeMax: new Date(Date.now() + daysOut * 86400000).toISOString(), timeZone: BUSINESS_TZ, items: [{ id: calId }] }) });
     busy = (d.calendars && d.calendars[calId] && d.calendars[calId].busy) || [];
   } catch (e) { console.error('freebusy error', e.message); return { error: 'calendar unavailable' }; }
-  const windows = [{ label: 'morning', hour: 9, end: 12 }, { label: 'afternoon', hour: 13, end: 16 }];
+  const busyMs = busy.map(b => ({ s: new Date(b.start).getTime(), e: new Date(b.end).getTime() + BUFFER_MIN * 60000 }));
   const slots = [];
+  const minLead = Date.now() + 2 * 3600000;
   for (let dd = 1; dd <= daysOut && slots.length < maxSlots; dd++) {
-    const day = ymd(dd), wd = weekday(day);
-    if (wd === 'Sunday') continue;
-    for (const w of windows) {
-      if (slots.length >= maxSlots) break;
-      const start = wallToUtc(day, w.hour), end = wallToUtc(day, w.end);
-      if (start < new Date()) continue;
-      if (!busy.some(b => new Date(b.start) < end && new Date(b.end) > start))
-        slots.push({ label: `${wd} ${w.label} (${day})`, start_iso: start.toISOString(), window: w.label });
+    const day = ymd(dd);
+    if (weekday(day) === 'Sunday') continue;
+    for (let mins = DAY_START * 60; mins + estimate <= DAY_END * 60 && slots.length < maxSlots; mins += 30) {
+      const start = wallToUtc(day, Math.floor(mins / 60), mins % 60);
+      const sMs = start.getTime();
+      if (sMs < minLead) continue;
+      const eMs = sMs + (estimate + BUFFER_MIN) * 60000;
+      if (busyMs.some(b => b.s < eMs && b.e > sMs)) continue;
+      slots.push({ label: start.toLocaleString('en-US', { timeZone: BUSINESS_TZ, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }), start_iso: start.toISOString() });
+      mins += 120; // spread offered times across the day
     }
   }
-  return { slots };
+  return { slots, estimated_minutes: estimate };
 }
 
 async function appendLead(d = {}) {
@@ -228,10 +244,12 @@ async function sendBookingEmails(a, when) {
 async function bookJob(a = {}) {
   if (!getCreds()) return { error: 'calendar not configured' };
   const id = encodeURIComponent(process.env.GOOGLE_CALENDAR_ID);
-  const start = new Date(a.start_iso), end = new Date(start.getTime() + 3 * 3600 * 1000);
+  const start = new Date(a.start_iso);
+  const jobMin = estimateMinutes(a);
+  const end = new Date(start.getTime() + jobMin * 60000);
   const when = start.toLocaleString('en-US', { timeZone: BUSINESS_TZ, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
   try {
-    await gfetch(`https://www.googleapis.com/calendar/v3/calendars/${id}/events`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ summary: `Leaf cleanup — ${a.name || 'Customer'}`, description: `Service: ${a.service || ''}\nQuote: ${a.quote || ''}\nPhone: ${a.phone || ''}\nNotes: ${a.notes || ''}`, location: a.address || '', start: { dateTime: start.toISOString(), timeZone: BUSINESS_TZ }, end: { dateTime: end.toISOString(), timeZone: BUSINESS_TZ } }) });
+    await gfetch(`https://www.googleapis.com/calendar/v3/calendars/${id}/events`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ summary: `Leaf cleanup — ${a.name || 'Customer'} (~${jobMin} min)`, description: `Service: ${a.service || ''}\nQuote: ${a.quote || ''}\nEst. time: ${jobMin} min (+1h buffer)\nPhone: ${a.phone || ''}\nEmail: ${a.email || ''}\nNotes: ${a.notes || ''}`, location: a.address || '', start: { dateTime: start.toISOString(), timeZone: BUSINESS_TZ }, end: { dateTime: end.toISOString(), timeZone: BUSINESS_TZ } }) });
   } catch (e) { console.error('book error', e.message); return { error: 'could not book' }; }
   await appendLead({ ...a, status: 'Booked', notes: `${a.notes || ''} | booked ${when}` });
   await sendBookingEmails(a, when);
@@ -287,7 +305,7 @@ const TOOLS = [
   },
   {
     type: 'function',
-    function: { name: 'check_availability', description: 'Get real open appointment windows from the calendar. Call before offering times. Returns a list of slots with a label and start_iso.', parameters: { type: 'object', properties: {} } }
+    function: { name: 'check_availability', description: 'Get real open appointment times that fit this job. Pass yard_size and leaf_load (the same ones used for the quote) so each offered time is long enough for the work plus a 1-hour buffer. Returns slots with a label and start_iso.', parameters: { type: 'object', properties: { yard_size: { type: 'string', enum: ['small', 'medium', 'large', 'acreage'] }, leaf_load: { type: 'string', enum: ['light', 'average', 'heavy'] }, acres: { type: 'number' } } } }
   },
   {
     type: 'function',
@@ -299,7 +317,7 @@ const TOOLS = [
         properties: {
           start_iso: { type: 'string', description: 'start_iso from a check_availability slot' },
           name: { type: 'string' }, phone: { type: 'string' }, address: { type: 'string' },
-          service: { type: 'string' }, quote: { type: 'string', description: 'quoted price, e.g. $270' }, email: { type: 'string', description: 'customer email for a confirmation, if provided' }, notes: { type: 'string' }
+          service: { type: 'string' }, quote: { type: 'string', description: 'quoted price, e.g. $270' }, yard_size: { type: 'string', enum: ['small', 'medium', 'large', 'acreage'], description: 'so the appointment is blocked for the right duration' }, leaf_load: { type: 'string', enum: ['light', 'average', 'heavy'] }, email: { type: 'string', description: 'customer email for a confirmation, if provided' }, notes: { type: 'string' }
         },
         required: ['start_iso', 'name', 'phone', 'address']
       }
@@ -332,14 +350,14 @@ const TOOLS = [
 
 // Same tools, flattened for the Realtime (voice) API.
 const REALTIME_TOOLS = TOOLS.map(t => ({ type: 'function', name: t.function.name, description: t.function.description, parameters: t.function.parameters }));
-const VOICE_PROMPT = SYSTEM_PROMPT + '\n\nTOOLS: For any price, call compute_quote and use its exact number — never do pricing math yourself. To schedule, call check_availability and offer a couple of the returned windows; once the caller picks one and you have their name, phone, and address, call book_job to lock it in, then confirm the day, time, and price. If they share contact info but do not book, call save_lead.';
+const VOICE_PROMPT = SYSTEM_PROMPT + '\n\nTOOLS: For any price, call compute_quote and use its exact number — never do pricing math yourself. To schedule, call check_availability (pass the yard_size and leaf_load from the quote so the slot fits the job) and offer a couple of the returned times; once the caller picks one and you have their name, phone, and address, call book_job (also pass yard_size and leaf_load) to lock it in, then confirm the day, time, and price. If they share contact info but do not book, call save_lead.';
 
 async function runTool(name, argStr, source) {
   let args = {};
   try { args = JSON.parse(argStr || '{}'); } catch {}
   try {
     if (name === 'compute_quote') return computeQuote(args);
-    if (name === 'check_availability') return await getAvailability();
+    if (name === 'check_availability') return await getAvailability(args);
     if (name === 'book_job') return await bookJob({ ...args, source });
     if (name === 'save_lead') return await appendLead({ ...args, source });
     if (name === 'lookup_customer') return await lookupCustomer(args);
