@@ -3,6 +3,7 @@ import express from 'express';
 import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import crypto from 'crypto';
+import fs from 'fs';
 
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -51,6 +52,12 @@ app.use(express.json({ limit: '12mb' }));
 app.get('/', (req, res) => {
   res.send('The Leaf Busters AI assistant is running.');
 });
+
+// Public base URL (used to embed the logo in emails). Override with PUBLIC_URL if the host changes.
+const PUBLIC_URL = (process.env.PUBLIC_URL || 'https://leaf-busters-ai.onrender.com').replace(/\/$/, '');
+let LOGO_BUF = null;
+try { LOGO_BUF = fs.readFileSync('email_logo.jpg'); } catch (e) { console.error('logo load', e.message); }
+app.get('/logo.jpg', (req, res) => { if (!LOGO_BUF) return res.sendStatus(404); res.set('Cache-Control', 'public, max-age=86400'); res.type('jpeg').send(LOGO_BUF); });
 
 // Non-secret diagnostic: which service account + calendar the server uses.
 app.get('/whoami', (req, res) => {
@@ -248,12 +255,55 @@ async function sendEmail(to, subject, html) {
   } catch (e) { console.error('email error', e.message); }
 }
 
+function escHtml(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+
+// Branded HTML email matching theleafbusters.com (dark theme, cream wordmark, burnt-orange accents).
+function brandedEmail(heading, introHtml, rows, footerNote) {
+  const rowHtml = rows.map(([k, v, accent]) => `
+    <tr>
+      <td style="padding:8px 0;color:#c9b896;font:600 12px/1.4 'Arial Narrow',Arial,sans-serif;letter-spacing:1px;text-transform:uppercase;width:118px;vertical-align:top">${escHtml(k)}</td>
+      <td style="padding:8px 0;color:${accent ? '#ec7a1e' : '#f4eee0'};font:${accent ? '700 19px' : '400 15px'}/1.5 Arial,sans-serif">${escHtml(v)}</td>
+    </tr>`).join('');
+  return `<!doctype html><html><body style="margin:0;padding:0;background:#100e0c">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#100e0c"><tr><td align="center" style="padding:24px 12px">
+    <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#1b1714;border:1px solid rgba(236,224,196,.14);border-radius:16px;overflow:hidden">
+      <tr><td align="center" style="background:#100e0c;padding:26px 20px 18px">
+        <img src="${PUBLIC_URL}/logo.jpg" width="150" alt="The Leaf Busters" style="display:block;border:0;width:150px;max-width:62%;height:auto;margin:0 auto 12px">
+        <div style="color:#ece0c4;font:700 26px/1 'Arial Narrow',Arial,sans-serif;letter-spacing:3px;text-transform:uppercase">The Leaf Busters</div>
+        <div style="color:#d2691e;font:600 12px/1.4 'Arial Narrow',Arial,sans-serif;letter-spacing:3px;text-transform:uppercase;margin-top:6px">Leaf Cleanup &amp; Removal</div>
+      </td></tr>
+      <tr><td style="height:4px;background:#d2691e;font-size:0;line-height:0">&nbsp;</td></tr>
+      <tr><td style="padding:26px 30px 4px">
+        <h1 style="margin:0 0 10px;color:#f3ead2;font:700 22px/1.25 'Arial Narrow',Arial,sans-serif;letter-spacing:.5px">${heading}</h1>
+        <div style="color:#c9b896;font:400 15px/1.6 Arial,sans-serif">${introHtml}</div>
+      </td></tr>
+      <tr><td style="padding:16px 30px 4px">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#211b16;border:1px solid rgba(236,224,196,.12);border-radius:12px">
+          <tr><td style="padding:6px 18px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0">${rowHtml}</table></td></tr>
+        </table>
+      </td></tr>
+      ${footerNote ? `<tr><td style="padding:16px 30px 4px;color:#c9b896;font:400 13px/1.6 Arial,sans-serif">${footerNote}</td></tr>` : ''}
+      <tr><td align="center" style="padding:22px 30px 28px">
+        <a href="tel:+18443529136" style="color:#ec7a1e;text-decoration:none;font:700 16px Arial,sans-serif">(844) 352-9136</a>
+        <div style="color:#8a6a3f;font:400 12px Arial,sans-serif;margin-top:6px">theleafbusters.com &nbsp;&bull;&nbsp; Freeport, IL &amp; Stephenson County</div>
+      </td></tr>
+    </table>
+  </td></tr></table></body></html>`;
+}
+
 async function sendBookingEmails(a, when) {
+  const price = a.quote || 'We will confirm';
   const alertTo = process.env.ALERT_EMAIL;
   if (alertTo) await sendEmail(alertTo, `New booking: ${a.name || 'Customer'} — ${when}`,
-    `<h2>New cleanup booked</h2><p><b>When:</b> ${when}<br><b>Name:</b> ${a.name || ''}<br><b>Phone:</b> ${a.phone || ''}<br><b>Email:</b> ${a.email || ''}<br><b>Address:</b> ${a.address || ''}<br><b>Service:</b> ${a.service || ''}<br><b>Quote:</b> ${a.quote || ''}<br><b>Notes:</b> ${a.notes || ''}</p>`);
+    brandedEmail('New cleanup booked', 'A new job just came in through the assistant.', [
+      ['When', when], ['Name', a.name || ''], ['Phone', a.phone || ''], ['Email', a.email || ''],
+      ['Address', a.address || ''], ['Service', a.service || 'Leaf cleanup'], ['Quote', price, true],
+      ['Notes', a.notes || '—']
+    ], ''));
   if (a.email) await sendEmail(a.email, 'Your Leaf Busters cleanup is booked',
-    `<p>Hi ${a.name || 'there'},</p><p>You're booked with The Leaf Busters!</p><p><b>When:</b> ${when}<br><b>Address:</b> ${a.address || ''}<br><b>Service:</b> ${a.service || 'Leaf cleanup'}<br><b>Price:</b> ${a.quote || 'we will confirm'}</p><p>Questions? Reply here or call (844) 352-9136.</p><p>— The Leaf Busters</p>`);
+    brandedEmail("You're booked! 🍂", `Hi ${escHtml(a.name || 'there')}, thanks for choosing The Leaf Busters — your cleanup is on the schedule. Here's what to expect:`, [
+      ['When', when], ['Address', a.address || ''], ['Service', a.service || 'Leaf cleanup'], ['Price', price, true]
+    ], 'No need to be home — just make sure the yard is accessible. Payment is due when the job is done. Need to reschedule for weather? It\'s free; reply to this email or give us a call.'));
 }
 
 async function bookJob(a = {}) {
