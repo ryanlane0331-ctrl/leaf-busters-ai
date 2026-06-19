@@ -102,7 +102,7 @@ app.post('/sms', async (req, res) => {
 // In-memory conversation per session (resets on restart; persistence comes with the dashboard).
 // ---------------------------------------------------------------------------
 const sessions = new Map();
-const WEB_PROMPT = SYSTEM_PROMPT + '\n\nYou are now chatting on the website. Keep replies short and friendly (1-3 sentences). For ANY price, you MUST call the compute_quote tool and use the exact number it returns — never do the pricing math yourself. When the customer is ready to book: call check_availability to get real open windows and offer a couple of them; once they pick one and you have their name, phone, and service address, call book_job to lock it in, then confirm the day/time and price back to them. If they share contact info but are not ready to book, call save_lead so we can follow up. Never ask them to fill out a form — you handle everything right here in the chat. If the customer sends a photo of their yard, look at it to judge the yard size and leaf load, then call compute_quote. When a customer gives a phone number or a name, call lookup_customer — if they are a returning customer, greet them by name and apply the returning-customer discount.';
+const WEB_PROMPT = SYSTEM_PROMPT + '\n\nYou are now chatting on the website. Keep replies short and friendly (1-3 sentences). For ANY price, you MUST call the compute_quote tool and use the exact number it returns — never do the pricing math yourself. When the customer is ready to book: call check_availability to get real open windows and offer a couple of them; once they pick one and you have their name, phone, and service address, call book_job to lock it in, then confirm the day/time and price back to them. If they share contact info but are not ready to book, call save_lead so we can follow up. Never ask them to fill out a form — you handle everything right here in the chat. If the customer sends a photo of their yard, look at it to judge the yard size and leaf load, then call compute_quote. When a customer gives a phone number or a name, call lookup_customer — if they are a returning customer, greet them by name and apply the returning-customer discount. When booking, also ask for the customer\'s email so we can send a confirmation, and pass it to book_job.';
 
 // Deterministic pricing engine. The AI calls this via the compute_quote tool so every quote is exact.
 function computeQuote({ yard_size, acres, leaf_load = 'average', brush = 'none', gutters = 'none', extra_trucks = 0, discount = 'none' }) {
@@ -200,9 +200,29 @@ async function appendLead(d = {}) {
   const id = encodeURIComponent(process.env.GOOGLE_SHEET_ID);
   const ts = new Date().toLocaleString('en-US', { timeZone: BUSINESS_TZ });
   try {
-    await gfetch(`https://sheets.googleapis.com/v4/spreadsheets/${id}/values/A1:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: [[ts, d.name || '', d.phone || '', d.address || '', d.service || '', d.yard_size || '', d.leaf_load || '', d.quote || '', d.type || '', d.status || 'New', d.source || 'Web chat', d.notes || '']] }) });
+    await gfetch(`https://sheets.googleapis.com/v4/spreadsheets/${id}/values/A1:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: [[ts, d.name || '', d.phone || '', d.address || '', d.service || '', d.yard_size || '', d.leaf_load || '', d.quote || '', d.type || '', d.status || 'New', d.source || 'Web chat', (d.email ? 'Email: ' + d.email + ' | ' : '') + (d.notes || '')]] }) });
   } catch (e) { console.error('append lead error', e.message); return { error: 'could not save' }; }
   return { saved: true };
+}
+
+async function sendEmail(to, subject, html) {
+  if (!process.env.RESEND_API_KEY || !to) return;
+  const from = process.env.FROM_EMAIL || 'The Leaf Busters <onboarding@resend.dev>';
+  try {
+    await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from, to: [to], subject, html })
+    });
+  } catch (e) { console.error('email error', e.message); }
+}
+
+async function sendBookingEmails(a, when) {
+  const alertTo = process.env.ALERT_EMAIL;
+  if (alertTo) await sendEmail(alertTo, `New booking: ${a.name || 'Customer'} — ${when}`,
+    `<h2>New cleanup booked</h2><p><b>When:</b> ${when}<br><b>Name:</b> ${a.name || ''}<br><b>Phone:</b> ${a.phone || ''}<br><b>Email:</b> ${a.email || ''}<br><b>Address:</b> ${a.address || ''}<br><b>Service:</b> ${a.service || ''}<br><b>Quote:</b> ${a.quote || ''}<br><b>Notes:</b> ${a.notes || ''}</p>`);
+  if (a.email) await sendEmail(a.email, 'Your Leaf Busters cleanup is booked',
+    `<p>Hi ${a.name || 'there'},</p><p>You're booked with The Leaf Busters!</p><p><b>When:</b> ${when}<br><b>Address:</b> ${a.address || ''}<br><b>Service:</b> ${a.service || 'Leaf cleanup'}<br><b>Price:</b> ${a.quote || 'we will confirm'}</p><p>Questions? Reply here or call (844) 352-9136.</p><p>— The Leaf Busters</p>`);
 }
 
 async function bookJob(a = {}) {
@@ -214,6 +234,7 @@ async function bookJob(a = {}) {
     await gfetch(`https://www.googleapis.com/calendar/v3/calendars/${id}/events`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ summary: `Leaf cleanup — ${a.name || 'Customer'}`, description: `Service: ${a.service || ''}\nQuote: ${a.quote || ''}\nPhone: ${a.phone || ''}\nNotes: ${a.notes || ''}`, location: a.address || '', start: { dateTime: start.toISOString(), timeZone: BUSINESS_TZ }, end: { dateTime: end.toISOString(), timeZone: BUSINESS_TZ } }) });
   } catch (e) { console.error('book error', e.message); return { error: 'could not book' }; }
   await appendLead({ ...a, status: 'Booked', notes: `${a.notes || ''} | booked ${when}` });
+  await sendBookingEmails(a, when);
   return { booked: true, when };
 }
 
@@ -278,7 +299,7 @@ const TOOLS = [
         properties: {
           start_iso: { type: 'string', description: 'start_iso from a check_availability slot' },
           name: { type: 'string' }, phone: { type: 'string' }, address: { type: 'string' },
-          service: { type: 'string' }, quote: { type: 'string', description: 'quoted price, e.g. $270' }, notes: { type: 'string' }
+          service: { type: 'string' }, quote: { type: 'string', description: 'quoted price, e.g. $270' }, email: { type: 'string', description: 'customer email for a confirmation, if provided' }, notes: { type: 'string' }
         },
         required: ['start_iso', 'name', 'phone', 'address']
       }
