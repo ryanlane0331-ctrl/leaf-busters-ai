@@ -94,6 +94,50 @@ app.post('/sms', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Web chat: same "Buster" brain for the website chat widget.
+// In-memory conversation per session (resets on restart; persistence comes with the dashboard).
+// ---------------------------------------------------------------------------
+const sessions = new Map();
+const WEB_PROMPT = SYSTEM_PROMPT + '\n\nYou are now chatting on the website. Keep replies short and friendly (1-3 sentences). Quote using the pricing rules above. When the customer wants to book, collect their name, phone, service address, the service, and a preferred day/time, then confirm it back and tell them they will get a confirmation. Never ask them to fill out a form — you handle everything right here in the chat.';
+
+// CORS for the chat endpoint so the website (different origin) can call it.
+app.use('/chat', (req, res, next) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+app.post('/chat', async (req, res) => {
+  const { sessionId, message } = req.body || {};
+  const id = (sessionId || 'anon').toString().slice(0, 80);
+  if (!message) {
+    return res.json({ reply: "Hey! I'm Buster with The Leaf Busters. Tell me your address and about how big the yard is, and I'll get you an estimate right now." });
+  }
+  let history = sessions.get(id) || [{ role: 'system', content: WEB_PROMPT }];
+  history.push({ role: 'user', content: String(message).slice(0, 1000) });
+  let reply = "Sorry, I glitched for a second — can you say that again?";
+  try {
+    const r = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: SMS_MODEL, messages: history, temperature: 0.7, max_tokens: 300 })
+    });
+    const data = await r.json();
+    if (data?.choices?.[0]?.message?.content) {
+      reply = data.choices[0].message.content.trim();
+      history.push({ role: 'assistant', content: reply });
+    }
+  } catch (e) {
+    console.error('Chat error:', e.message);
+  }
+  if (history.length > 21) history = [history[0], ...history.slice(-20)];
+  sessions.set(id, history);
+  res.json({ reply });
+});
+
+// ---------------------------------------------------------------------------
 // Media stream bridge: Twilio <-> OpenAI Realtime
 // Twilio sends/receives 8kHz mu-law (g711_ulaw), which OpenAI Realtime supports directly.
 // ---------------------------------------------------------------------------
