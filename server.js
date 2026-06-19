@@ -272,6 +272,22 @@ const TOOLS = [
   }
 ];
 
+// Same tools, flattened for the Realtime (voice) API.
+const REALTIME_TOOLS = TOOLS.map(t => ({ type: 'function', name: t.function.name, description: t.function.description, parameters: t.function.parameters }));
+const VOICE_PROMPT = SYSTEM_PROMPT + '\n\nTOOLS: For any price, call compute_quote and use its exact number — never do pricing math yourself. To schedule, call check_availability and offer a couple of the returned windows; once the caller picks one and you have their name, phone, and address, call book_job to lock it in, then confirm the day, time, and price. If they share contact info but do not book, call save_lead.';
+
+async function runTool(name, argStr, source) {
+  let args = {};
+  try { args = JSON.parse(argStr || '{}'); } catch {}
+  try {
+    if (name === 'compute_quote') return computeQuote(args);
+    if (name === 'check_availability') return await getAvailability();
+    if (name === 'book_job') return await bookJob({ ...args, source });
+    if (name === 'save_lead') return await appendLead({ ...args, source });
+  } catch (e) { return { error: 'tool failed' }; }
+  return { error: 'unknown tool' };
+}
+
 // CORS for the chat endpoint so the website (different origin) can call it.
 app.use('/chat', (req, res, next) => {
   res.set('Access-Control-Allow-Origin', '*');
@@ -405,9 +421,11 @@ wss.on('connection', (twilioWs) => {
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
         voice: VOICE,
-        instructions: SYSTEM_PROMPT,
+        instructions: VOICE_PROMPT,
         modalities: ['text', 'audio'],
-        temperature: 0.8
+        temperature: 0.8,
+        tools: REALTIME_TOOLS,
+        tool_choice: 'auto'
       }
     }));
     // Ask the assistant to greet the caller first.
@@ -419,7 +437,7 @@ wss.on('connection', (twilioWs) => {
     }, 300);
   });
 
-  openaiWs.on('message', (raw) => {
+  openaiWs.on('message', async (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (msg.type === 'response.audio.delta' && msg.delta && streamSid) {
@@ -427,6 +445,11 @@ wss.on('connection', (twilioWs) => {
     } else if (msg.type === 'input_audio_buffer.speech_started' && streamSid) {
       // Caller started talking — stop our current playback so we don't talk over them.
       twilioWs.send(JSON.stringify({ event: 'clear', streamSid }));
+    } else if (msg.type === 'response.function_call_arguments.done') {
+      // The assistant called a tool — run it, return the result, and let it keep talking.
+      const result = await runTool(msg.name, msg.arguments, 'Phone call');
+      openaiWs.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: msg.call_id, output: JSON.stringify(result) } }));
+      openaiWs.send(JSON.stringify({ type: 'response.create' }));
     } else if (msg.type === 'error') {
       console.error('OpenAI error:', JSON.stringify(msg.error || msg));
     }
