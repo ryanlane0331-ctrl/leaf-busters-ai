@@ -45,8 +45,8 @@ OPENING LINE (say this when the call connects): "Thanks for calling The Leaf Bus
 // HTTP app
 // ---------------------------------------------------------------------------
 const app = express();
-app.use(express.urlencoded({ extended: false }));
-app.use(express.json());
+app.use(express.urlencoded({ extended: false, limit: '12mb' }));
+app.use(express.json({ limit: '12mb' }));
 
 app.get('/', (req, res) => {
   res.send('The Leaf Busters AI assistant is running.');
@@ -59,10 +59,13 @@ function escapeXml(s = '') {
 // Twilio Voice webhook: connect the call's audio to our media-stream WebSocket.
 app.all('/incoming-call', (req, res) => {
   const host = req.headers['x-forwarded-host'] || req.headers.host;
+  const from = escapeXml(req.body.From || '');
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="wss://${host}/media-stream" />
+    <Stream url="wss://${host}/media-stream">
+      <Parameter name="from" value="${from}" />
+    </Stream>
   </Connect>
 </Response>`;
   res.type('text/xml').send(twiml);
@@ -99,7 +102,7 @@ app.post('/sms', async (req, res) => {
 // In-memory conversation per session (resets on restart; persistence comes with the dashboard).
 // ---------------------------------------------------------------------------
 const sessions = new Map();
-const WEB_PROMPT = SYSTEM_PROMPT + '\n\nYou are now chatting on the website. Keep replies short and friendly (1-3 sentences). For ANY price, you MUST call the compute_quote tool and use the exact number it returns — never do the pricing math yourself. When the customer is ready to book: call check_availability to get real open windows and offer a couple of them; once they pick one and you have their name, phone, and service address, call book_job to lock it in, then confirm the day/time and price back to them. If they share contact info but are not ready to book, call save_lead so we can follow up. Never ask them to fill out a form — you handle everything right here in the chat.';
+const WEB_PROMPT = SYSTEM_PROMPT + '\n\nYou are now chatting on the website. Keep replies short and friendly (1-3 sentences). For ANY price, you MUST call the compute_quote tool and use the exact number it returns — never do the pricing math yourself. When the customer is ready to book: call check_availability to get real open windows and offer a couple of them; once they pick one and you have their name, phone, and service address, call book_job to lock it in, then confirm the day/time and price back to them. If they share contact info but are not ready to book, call save_lead so we can follow up. Never ask them to fill out a form — you handle everything right here in the chat. If the customer sends a photo of their yard, look at it to judge the yard size and leaf load, then call compute_quote. When a customer gives a phone number or a name, call lookup_customer — if they are a returning customer, greet them by name and apply the returning-customer discount.';
 
 // Deterministic pricing engine. The AI calls this via the compute_quote tool so every quote is exact.
 function computeQuote({ yard_size, acres, leaf_load = 'average', brush = 'none', gutters = 'none', extra_trucks = 0, discount = 'none' }) {
@@ -214,6 +217,32 @@ async function bookJob(a = {}) {
   return { booked: true, when };
 }
 
+async function readLeads() {
+  if (!getCreds()) return [];
+  try {
+    const id = encodeURIComponent(process.env.GOOGLE_SHEET_ID);
+    const d = await gfetch(`https://sheets.googleapis.com/v4/spreadsheets/${id}/values/A1:L5000`);
+    return d.values || [];
+  } catch (e) { console.error('readLeads error', e.message); return []; }
+}
+
+async function lookupCustomer({ phone, name } = {}) {
+  const rows = await readLeads();
+  if (rows.length < 2) return { found: false };
+  const norm = s => (s || '').replace(/\D/g, '').slice(-10);
+  const np = norm(phone);
+  const nm = (name || '').trim().toLowerCase();
+  for (let i = rows.length - 1; i >= 1; i--) {
+    const r = rows[i];
+    const rp = norm(r[2]);
+    const rn = (r[1] || '').trim().toLowerCase();
+    if ((np && rp && np === rp) || (nm && rn && nm === rn)) {
+      return { found: true, name: r[1] || '', address: r[3] || '', last_service: r[4] || '', last_status: r[9] || '' };
+    }
+  }
+  return { found: false };
+}
+
 const TOOLS = [
   {
     type: 'function',
@@ -269,6 +298,14 @@ const TOOLS = [
         }
       }
     }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'lookup_customer',
+      description: 'Check if this is a returning customer by phone or name. Call this when a customer shares their phone number or name. If found, greet them by name and you may apply the returning-customer discount.',
+      parameters: { type: 'object', properties: { phone: { type: 'string' }, name: { type: 'string' } } }
+    }
   }
 ];
 
@@ -284,6 +321,7 @@ async function runTool(name, argStr, source) {
     if (name === 'check_availability') return await getAvailability();
     if (name === 'book_job') return await bookJob({ ...args, source });
     if (name === 'save_lead') return await appendLead({ ...args, source });
+    if (name === 'lookup_customer') return await lookupCustomer(args);
   } catch (e) { return { error: 'tool failed' }; }
   return { error: 'unknown tool' };
 }
@@ -298,13 +336,18 @@ app.use('/chat', (req, res, next) => {
 });
 
 app.post('/chat', async (req, res) => {
-  const { sessionId, message } = req.body || {};
+  const { sessionId, message, image } = req.body || {};
   const id = (sessionId || 'anon').toString().slice(0, 80);
-  if (!message) {
+  if (!message && !image) {
     return res.json({ reply: "Hey! I'm Buster with The Leaf Busters. Tell me your address and about how big the yard is, and I'll get you an estimate right now." });
   }
   let history = sessions.get(id) || [{ role: 'system', content: WEB_PROMPT }];
-  history.push({ role: 'user', content: String(message).slice(0, 1000) });
+  const userIdx = history.length;
+  if (image) {
+    history.push({ role: 'user', content: [{ type: 'text', text: message || 'Here is a photo of my yard — about how much for a cleanup?' }, { type: 'image_url', image_url: { url: image } }] });
+  } else {
+    history.push({ role: 'user', content: String(message).slice(0, 1000) });
+  }
   let reply = "Sorry, I glitched for a second — can you say that again?";
   try {
     for (let hop = 0; hop < 4; hop++) {
@@ -319,15 +362,7 @@ app.post('/chat', async (req, res) => {
       history.push(m);
       if (m.tool_calls && m.tool_calls.length) {
         for (const tc of m.tool_calls) {
-          let result = {};
-          try {
-            const args = JSON.parse(tc.function.arguments || '{}');
-            const fn = tc.function.name;
-            if (fn === 'compute_quote') result = computeQuote(args);
-            else if (fn === 'check_availability') result = await getAvailability();
-            else if (fn === 'book_job') result = await bookJob({ ...args, source: 'Web chat' });
-            else if (fn === 'save_lead') result = await appendLead({ ...args, source: 'Web chat' });
-          } catch (err) { result = { error: 'tool failed' }; }
+          const result = await runTool(tc.function.name, tc.function.arguments, 'Web chat');
           history.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(result) });
         }
         continue;
@@ -338,6 +373,7 @@ app.post('/chat', async (req, res) => {
   } catch (e) {
     console.error('Chat error:', e.message);
   }
+  if (image && history[userIdx]) history[userIdx] = { role: 'user', content: '[customer sent a yard photo] ' + (message || '') };
   if (history.length > 30) history = [history[0], ...history.slice(-28)];
   sessions.set(id, history);
   res.json({ reply });
@@ -430,8 +466,6 @@ wss.on('connection', (twilioWs) => {
           tool_choice: 'auto'
         }
       }));
-      // Greet the caller first.
-      setTimeout(() => openaiWs.send(JSON.stringify({ type: 'response.create' })), 300);
     }, 250);
   });
 
@@ -456,12 +490,25 @@ wss.on('connection', (twilioWs) => {
   openaiWs.on('error', (e) => console.error('OpenAI WS error:', e.message));
   openaiWs.on('close', () => { if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close(); });
 
-  twilioWs.on('message', (raw) => {
+  twilioWs.on('message', async (raw) => {
     let data;
     try { data = JSON.parse(raw.toString()); } catch { return; }
     if (data.event === 'start') {
       streamSid = data.start.streamSid;
       console.log('Stream started:', streamSid);
+      const from = data.start.customParameters && data.start.customParameters.from;
+      let greetCtx = null;
+      if (from) {
+        try {
+          const c = await lookupCustomer({ phone: from });
+          if (c && c.found && c.name) greetCtx = `This caller is a returning customer named ${c.name}${c.address ? ' at ' + c.address : ''}. Greet them warmly by name and offer the returning-customer discount.`;
+        } catch (e) {}
+      }
+      setTimeout(() => {
+        if (openaiWs.readyState !== WebSocket.OPEN) return;
+        if (greetCtx) openaiWs.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '[System note: ' + greetCtx + ']' }] } }));
+        openaiWs.send(JSON.stringify({ type: 'response.create' }));
+      }, 500);
     } else if (data.event === 'media' && openaiWs.readyState === WebSocket.OPEN) {
       openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: data.media.payload }));
     } else if (data.event === 'stop') {
