@@ -156,10 +156,15 @@ async function gfetch(url, opts = {}) {
   const tok = await getToken(); if (!tok) throw new Error('no google token');
   let lastErr;
   for (let i = 0; i < 3; i++) {
+    let r;
     try {
-      const r = await fetch(url, { ...opts, headers: { ...(opts.headers || {}), Authorization: `Bearer ${tok}` } });
-      return await r.json();
-    } catch (e) { lastErr = e; await new Promise(s => setTimeout(s, 500)); }
+      r = await fetch(url, { ...opts, headers: { ...(opts.headers || {}), Authorization: `Bearer ${tok}` } });
+    } catch (e) { lastErr = e; await new Promise(s => setTimeout(s, 500)); continue; }
+    if (r.ok) return await r.json();
+    const body = await r.text().catch(() => '');
+    const err = new Error(`HTTP ${r.status}: ${body.slice(0, 300)}`);
+    if (r.status < 500) throw err;            // client error (auth/permission): surface now
+    lastErr = err; await new Promise(s => setTimeout(s, 500)); // server error: retry
   }
   throw lastErr;
 }
