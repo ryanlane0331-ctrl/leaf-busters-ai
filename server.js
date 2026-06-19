@@ -98,7 +98,44 @@ app.post('/sms', async (req, res) => {
 // In-memory conversation per session (resets on restart; persistence comes with the dashboard).
 // ---------------------------------------------------------------------------
 const sessions = new Map();
-const WEB_PROMPT = SYSTEM_PROMPT + '\n\nYou are now chatting on the website. Keep replies short and friendly (1-3 sentences). Quote using the pricing rules above. When the customer wants to book, collect their name, phone, service address, the service, and a preferred day/time, then confirm it back and tell them they will get a confirmation. Never ask them to fill out a form — you handle everything right here in the chat.';
+const WEB_PROMPT = SYSTEM_PROMPT + '\n\nYou are now chatting on the website. Keep replies short and friendly (1-3 sentences). For ANY price, you MUST call the compute_quote tool and use the exact number it returns — never do the pricing math yourself. When the customer wants to book, collect their name, phone, service address, the service, and a preferred day/time, then confirm it back and tell them they will get a confirmation. Never ask them to fill out a form — you handle everything right here in the chat.';
+
+// Deterministic pricing engine. The AI calls this via the compute_quote tool so every quote is exact.
+function computeQuote({ yard_size, acres, leaf_load = 'average', brush = 'none', gutters = 'none', extra_trucks = 0, discount = 'none' }) {
+  const baseMap = { small: 120, medium: 200, large: 375, acreage: 375 };
+  let base = baseMap[yard_size] ?? 200;
+  if (yard_size === 'acreage' && acres && acres > 1) base = 375 + 250 * (Math.ceil(acres) - 1);
+  const loadMult = { light: 0.85, average: 1.0, heavy: 1.35 }[leaf_load] ?? 1.0;
+  let price = base * loadMult;
+  price += ({ none: 0, light: 60, moderate: 125, heavy: 250 }[brush]) ?? 0;
+  price += ({ none: 0, single: 90, two: 150 }[gutters]) ?? 0;
+  price += (Number(extra_trucks) || 0) * 75;
+  price *= ({ none: 1, seasonal: 0.85, returning: 0.9, neighbor: 0.9 }[discount]) ?? 1;
+  price = Math.max(99, Math.round(price / 5) * 5);
+  const isEstimate = ['large', 'acreage'].includes(yard_size) || leaf_load === 'heavy' || gutters === 'two';
+  return { price, type: isEstimate ? 'estimate' : 'firm', inputs: { yard_size, acres, leaf_load, brush, gutters, extra_trucks, discount } };
+}
+
+const TOOLS = [{
+  type: 'function',
+  function: {
+    name: 'compute_quote',
+    description: 'Calculate the exact price for a leaf/yard cleanup. Call this whenever you quote a price. Always use the returned price; never do the math yourself. The result includes "type": "firm" (give it as a firm price) or "estimate" (give it but say you will confirm from 2 photos).',
+    parameters: {
+      type: 'object',
+      properties: {
+        yard_size: { type: 'string', enum: ['small', 'medium', 'large', 'acreage'], description: 'small = city lot under 1/4 acre; medium = 1/4-1/2 acre; large = 1/2-1 acre; acreage = 1+ acre' },
+        acres: { type: 'number', description: 'number of acres, only when yard_size is acreage' },
+        leaf_load: { type: 'string', enum: ['light', 'average', 'heavy'], description: 'light = few trees/thin scatter; average = typical fall; heavy = thick layer/many trees/late season' },
+        brush: { type: 'string', enum: ['none', 'light', 'moderate', 'heavy'], description: 'separate brush & debris removal amount' },
+        gutters: { type: 'string', enum: ['none', 'single', 'two'], description: 'gutter cleaning: single-story or two-story' },
+        extra_trucks: { type: 'integer', description: 'extra truckloads of hauling beyond the first' },
+        discount: { type: 'string', enum: ['none', 'seasonal', 'returning', 'neighbor'], description: 'apply at most one discount if it genuinely fits' }
+      },
+      required: ['yard_size', 'leaf_load']
+    }
+  }
+}];
 
 // CORS for the chat endpoint so the website (different origin) can call it.
 app.use('/chat', (req, res, next) => {
@@ -119,22 +156,34 @@ app.post('/chat', async (req, res) => {
   history.push({ role: 'user', content: String(message).slice(0, 1000) });
   let reply = "Sorry, I glitched for a second — can you say that again?";
   try {
-    const r = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: SMS_MODEL, messages: history, temperature: 0.7, max_tokens: 300 })
-    });
-    const data = await r.json();
-    if (data?.choices?.[0]?.message?.content) {
-      reply = data.choices[0].message.content.trim();
-      history.push({ role: 'assistant', content: reply });
-    } else {
-      console.error('OpenAI chat no choices. HTTP', r.status, JSON.stringify(data).slice(0, 400));
+    for (let hop = 0; hop < 4; hop++) {
+      const r = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: SMS_MODEL, messages: history, tools: TOOLS, temperature: 0.6, max_tokens: 350 })
+      });
+      const data = await r.json();
+      const m = data?.choices?.[0]?.message;
+      if (!m) { console.error('OpenAI chat no choices. HTTP', r.status, JSON.stringify(data).slice(0, 400)); break; }
+      history.push(m);
+      if (m.tool_calls && m.tool_calls.length) {
+        for (const tc of m.tool_calls) {
+          let result = {};
+          try {
+            const args = JSON.parse(tc.function.arguments || '{}');
+            if (tc.function.name === 'compute_quote') result = computeQuote(args);
+          } catch (err) { result = { error: 'could not compute' }; }
+          history.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(result) });
+        }
+        continue;
+      }
+      reply = (m.content || reply).trim();
+      break;
     }
   } catch (e) {
     console.error('Chat error:', e.message);
   }
-  if (history.length > 21) history = [history[0], ...history.slice(-20)];
+  if (history.length > 30) history = [history[0], ...history.slice(-28)];
   sessions.set(id, history);
   res.json({ reply });
 });
