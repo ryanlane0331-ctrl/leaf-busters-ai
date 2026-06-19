@@ -404,7 +404,7 @@ app.post('/chat', async (req, res) => {
   }
   let reply = "Sorry, I glitched for a second — can you say that again?";
   try {
-    for (let hop = 0; hop < 4; hop++) {
+    for (let hop = 0; hop < 8; hop++) {
       const r = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
         headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
