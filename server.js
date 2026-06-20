@@ -41,6 +41,8 @@ TO BOOK A JOB: collect the caller's name, phone number, and service address, and
 
 SEASONAL FALL PLAN: After you quote a single cleanup, proactively offer the fall plan — all the season's cleanups (usually 3, spaced about every 3-4 weeks) at 15% off every visit — e.g., "Want me to lock in all three fall cleanups and save you 15%?" If they go for it, get the first opening from check_availability and call book_season (it schedules all the visits and applies the discount automatically), then confirm the dates and the per-visit price. Use book_season for the plan; use book_job only for a single one-time cleanup.
 
+NEIGHBOR DISCOUNT: We leave door hangers on homes near jobs we complete, offering neighbors 10% off their first cleanup. If a CALLER mentions a door hanger, the neighbor discount, or asks for a discount because we worked nearby, get their address and call verify_neighbor_discount. If it returns eligible:true, warmly confirm it ("We were just over on that street!") and pass discount:'neighbor' to compute_quote. If eligible:false, don't promise the neighbor discount — quote the normal price and you can still offer the seasonal plan. (Website visitors who scanned the door-hanger QR are already confirmed eligible — apply discount:'neighbor' without re-verifying.)
+
 RULES: Be truthful about the pricing above — never invent services or prices. Never share other customers' information. If someone has a complaint or something you truly cannot handle, take their details and say the owner will follow up. Keep it friendly and get them booked.
 
 LEAF EMERGENCY CLASSIFICATION SYSTEM: classify the caller's situation out loud — it's part of your charm — then still gather the real details (yard size, leaf load, and any sticks/branches/storm debris) to run the quote.
@@ -429,6 +431,33 @@ async function lookupCustomer({ phone, name } = {}) {
   return { found: false };
 }
 
+// --- Neighbor discount: confirm we've worked at/near a caller's address ---
+function streetKey(addr) {
+  let s = (addr || '').toLowerCase().split(',')[0].replace(/^\s*\d+\s*/, '');
+  s = s.replace(/\b(n|s|e|w|north|south|east|west)\b\.?/g, ' ');
+  s = s.replace(/\b(st|street|ave|avenue|rd|road|dr|drive|ln|lane|ct|court|blvd|way|pl|place|cir|circle|ter|terrace|hwy|highway|trl|trail|pkwy|parkway)\b\.?/g, ' ');
+  return s.replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+function zipOf(addr) { const m = (addr || '').match(/\b(\d{5})\b/); return m ? m[1] : ''; }
+function townOf(addr) { const p = (addr || '').split(','); return p.length > 1 ? p[1].toLowerCase().replace(/[^a-z ]/g, '').trim() : ''; }
+
+async function verifyNeighborDiscount({ address } = {}) {
+  if (!address) return { eligible: false, reason: 'need the customer address to check' };
+  const rows = await readLeads();
+  if (rows.length < 2) return { eligible: false };
+  const sk = streetKey(address), z = zipOf(address), tn = townOf(address);
+  for (let i = rows.length - 1; i >= 1; i--) {
+    const r = rows[i]; const status = (r[9] || '').toLowerCase(); const addr = r[3] || '';
+    if (!addr) continue;
+    if (!/(book|done|complete|paid|schedul)/.test(status)) continue; // a job we did or have scheduled
+    const sk2 = streetKey(addr), z2 = zipOf(addr), tn2 = townOf(addr);
+    if (sk && sk2 && sk === sk2) return { eligible: true, match: 'same street', near: addr };
+    if (z && z2 && z === z2) return { eligible: true, match: 'same ZIP code', near: addr };
+    if (tn && tn2 && tn === tn2) return { eligible: true, match: 'same town', near: addr };
+  }
+  return { eligible: false };
+}
+
 const TOOLS = [
   {
     type: 'function',
@@ -511,6 +540,14 @@ const TOOLS = [
       description: 'Check if this is a returning customer by phone or name. Call this when a customer shares their phone number or name. If found, greet them by name and you may apply the returning-customer discount.',
       parameters: { type: 'object', properties: { phone: { type: 'string' }, name: { type: 'string' } } }
     }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'verify_neighbor_discount',
+      description: "Check whether a caller qualifies for the 10% NEIGHBOR discount by confirming we have a completed or scheduled job at or near their address. Call this when a caller mentions a door hanger, the neighbor discount, or asks for a discount because we worked nearby. Returns {eligible, match, near}. Only apply discount:'neighbor' if eligible is true.",
+      parameters: { type: 'object', properties: { address: { type: 'string', description: "the caller's street address" } }, required: ['address'] }
+    }
   }
 ];
 
@@ -528,6 +565,7 @@ async function runTool(name, argStr, source) {
     if (name === 'book_season') return await bookSeason({ ...args, source });
     if (name === 'save_lead') return await appendLead({ ...args, source });
     if (name === 'lookup_customer') return await lookupCustomer(args);
+    if (name === 'verify_neighbor_discount') return await verifyNeighborDiscount(args);
   } catch (e) { return { error: 'tool failed' }; }
   return { error: 'unknown tool' };
 }
@@ -542,12 +580,18 @@ app.use('/chat', (req, res, next) => {
 });
 
 app.post('/chat', async (req, res) => {
-  const { sessionId, message, image } = req.body || {};
+  const { sessionId, message, image, referral } = req.body || {};
   const id = (sessionId || 'anon').toString().slice(0, 80);
+  const isNbr = referral && /neighbor|nbr|door|tag/i.test(String(referral));
   if (!message && !image) {
-    return res.json({ reply: "Hey! I'm Buster with The Leaf Busters. Tell me your address and about how big the yard is, and I'll get you an estimate right now." });
+    return res.json({ reply: isNbr
+      ? "Hey neighbor! Buster here with The Leaf Busters — since you scanned our door hanger, your 10% neighbor discount is already locked in. Tell me your address and about how big the yard is and I'll get you a price."
+      : "Hey! I'm Buster with The Leaf Busters. Tell me your address and about how big the yard is, and I'll get you an estimate right now." });
   }
   let history = sessions.get(id) || [{ role: 'system', content: WEB_PROMPT }];
+  if (isNbr && !history.some(h => typeof h.content === 'string' && h.content.includes('NEIGHBOR_DISCOUNT_CTX'))) {
+    history.push({ role: 'system', content: "NEIGHBOR_DISCOUNT_CTX: This visitor scanned a Leaf Busters neighborhood door hanger, so they qualify for the 10% NEIGHBOR discount on their first cleanup — no verification needed. Greet them warmly as a neighbor, tell them their 10% neighbor discount is locked in, and pass discount:'neighbor' to compute_quote for every quote this session." });
+  }
   const userIdx = history.length;
   if (image) {
     history.push({ role: 'user', content: [{ type: 'text', text: message || 'Here is a photo of my yard — about how much for a cleanup?' }, { type: 'image_url', image_url: { url: image } }] });
