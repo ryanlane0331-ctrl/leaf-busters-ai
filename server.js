@@ -756,7 +756,7 @@ wss.on('connection', (twilioWs) => {
           model: REALTIME_MODEL,
           output_modalities: ['audio'],
           audio: {
-            input: { format: { type: 'audio/pcmu' }, noise_reduction: { type: 'far_field' }, turn_detection: { type: 'server_vad', threshold: 0.72, prefix_padding_ms: 300, silence_duration_ms: 1300 } },
+            input: { format: { type: 'audio/pcmu' }, noise_reduction: { type: 'near_field' }, turn_detection: { type: 'server_vad', threshold: 0.55, prefix_padding_ms: 300, silence_duration_ms: 1100 } },
             output: { format: { type: 'audio/pcmu' }, voice: VOICE }
           },
           instructions: VOICE_PROMPT,
@@ -764,6 +764,12 @@ wss.on('connection', (twilioWs) => {
           tool_choice: 'auto'
         }
       }));
+      // Buster greets first so the caller immediately hears him (no dead air).
+      setTimeout(() => {
+        try {
+          openaiWs.send(JSON.stringify({ type: 'response.create', response: { instructions: "Greet the caller right now in your warm Buster dispatcher voice: say this is Buster with The Leaf Busters and ask how you can help with their yard today. Keep it to one short, friendly sentence." } }));
+        } catch (e) {}
+      }, 500);
     }, 250);
   });
 
