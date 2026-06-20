@@ -636,6 +636,118 @@ wss.on('connection', (twilioWs) => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Automated follow-ups: morning owner briefing, post-job review requests,
+// and win-back emails for quotes that never booked. Runs on an internal timer.
+// ---------------------------------------------------------------------------
+function chiNow() {
+  const d = new Date();
+  const ymdStr = d.toLocaleDateString('en-CA', { timeZone: BUSINESS_TZ });
+  const hour = parseInt(new Intl.DateTimeFormat('en-US', { timeZone: BUSINESS_TZ, hour: '2-digit', hourCycle: 'h23' }).format(d), 10);
+  return { ymd: ymdStr, hour };
+}
+function fld(desc, label) { const m = (desc || '').match(new RegExp(label + ':\\s*([^\\n]*)')); return m ? m[1].trim() : ''; }
+
+async function getEventsForDay(offset) {
+  if (!getCreds()) return [];
+  const day = ymd(offset);
+  const start = wallToUtc(day, 0, 0), end = wallToUtc(day, 23, 59);
+  const id = encodeURIComponent(process.env.GOOGLE_CALENDAR_ID);
+  try {
+    const d = await gfetch(`https://www.googleapis.com/calendar/v3/calendars/${id}/events?timeMin=${encodeURIComponent(start.toISOString())}&timeMax=${encodeURIComponent(end.toISOString())}&singleEvents=true&orderBy=startTime`);
+    return (d.items || []).filter(ev => ev.start && ev.start.dateTime).map(ev => {
+      const desc = ev.description || '';
+      return {
+        time: new Date(ev.start.dateTime).toLocaleString('en-US', { timeZone: BUSINESS_TZ, weekday: 'short', hour: 'numeric', minute: '2-digit' }),
+        location: ev.location || fld(desc, 'Address') || '',
+        email: (desc.match(/Email:\s*([^\s|]+@[^\s|]+)/) || [])[1] || '',
+        name: (ev.summary || '').replace(/^Leaf cleanup\s*[—-]\s*/, '').replace(/\s*\(.*\)$/, '').trim() || 'there',
+        quote: fld(desc, 'Quote'),
+        service: fld(desc, 'Service') || 'Leaf cleanup'
+      };
+    });
+  } catch (e) { console.error('getEventsForDay', e.message); return []; }
+}
+
+async function dailyBriefing(off) {
+  off = off || 0;
+  const to = process.env.ALERT_EMAIL; if (!to) return;
+  const ev = await getEventsForDay(off);
+  const label = new Date(Date.now() + off * 86400000).toLocaleDateString('en-US', { timeZone: BUSINESS_TZ, weekday: 'long', month: 'long', day: 'numeric' });
+  let rows;
+  if (!ev.length) rows = [['Date', label], ['Schedule', 'No jobs on the board — quiet day at HQ.']];
+  else { rows = [['Date', label], ['Jobs', String(ev.length)]]; ev.forEach(e => rows.push([e.time, `${e.name} — ${e.location}${e.quote ? ' — ' + e.quote : ''}`])); }
+  await sendEmail(to, `Dispatch briefing — ${label} (${ev.length} job${ev.length === 1 ? '' : 's'})`,
+    brandedEmail('Today’s dispatch', 'Here’s your containment schedule. Go get ’em, Buck.', rows, 'Your automated morning briefing from Buster — Leaf Busters Dispatch.'));
+  console.error('briefing sent', ev.length);
+}
+
+async function reviewRequests(off) {
+  off = (off === undefined) ? -1 : off;
+  const ev = await getEventsForDay(off);
+  const link = process.env.REVIEW_URL || 'https://theleafbusters.com';
+  let n = 0;
+  for (const e of ev) {
+    if (!e.email) continue;
+    await sendEmail(e.email, 'How did we do? — The Leaf Busters',
+      brandedEmail('Another successful containment! 🍂', `Hi ${escHtml(e.name)}, thanks for trusting The Leaf Busters with your cleanup. If Buck did right by your yard, a quick review means the world to a local business.`,
+        [], `<a href="${link}" style="display:inline-block;background:#d2691e;color:#fff7ec;text-decoration:none;font:700 16px Arial,sans-serif;padding:12px 22px;border-radius:8px">Leave a 5-star review</a>`));
+    n++;
+  }
+  console.error('review requests sent', n);
+}
+
+async function winBackFollowups(off) {
+  const rows = await readLeads();
+  if (rows.length < 2) return;
+  const dayStr = new Date(Date.now() + ((off === undefined ? -1 : off) * 86400000)).toLocaleDateString('en-US', { timeZone: BUSINESS_TZ });
+  const booked = new Set();
+  for (let i = 1; i < rows.length; i++) {
+    if ((rows[i][9] || '').toLowerCase().indexOf('booked') >= 0) {
+      const be = ((rows[i][11] || '').match(/Email:\s*([^\s|]+@[^\s|]+)/) || [])[1];
+      if (be) booked.add(be.toLowerCase());
+    }
+  }
+  let n = 0;
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const status = (r[9] || '').toLowerCase(), notes = r[11] || '';
+    if (status.indexOf('booked') >= 0) continue;
+    if ((r[0] || '').indexOf(dayStr) !== 0) continue;
+    const email = (notes.match(/Email:\s*([^\s|]+@[^\s|]+)/) || [])[1];
+    if (!email || booked.has(email.toLowerCase())) continue;
+    const name = (r[1] || 'there').trim(); const quote = r[7] || '';
+    await sendEmail(email, 'Still want your yard back under control? — The Leaf Busters',
+      brandedEmail('Your cleanup is still on standby', `Hi ${escHtml(name)}, Buster here from Leaf Busters Dispatch. You priced out a cleanup${quote ? ' around ' + escHtml(quote) : ''} but didn’t lock in a date yet. Want me to get a containment crew scheduled?`,
+        quote ? [['Your quote', quote]] : [],
+        `<a href="https://theleafbusters.com" style="display:inline-block;background:#d2691e;color:#fff7ec;text-decoration:none;font:700 16px Arial,sans-serif;padding:12px 22px;border-radius:8px">Book my cleanup</a> &nbsp; or call <a href="tel:+18443529136" style="color:#ec7a1e;text-decoration:none">(844) 352-9136</a>`));
+    n++;
+  }
+  console.error('winback sent', n);
+}
+
+let _ranBrief = '', _ranEve = '';
+setInterval(async () => {
+  try {
+    const { ymd: today, hour } = chiNow();
+    if (hour === 6 && _ranBrief !== today) { _ranBrief = today; await dailyBriefing(0); }
+    if (hour === 18 && _ranEve !== today) { _ranEve = today; await reviewRequests(-1); await winBackFollowups(-1); }
+  } catch (e) { console.error('scheduler error', e.message); }
+}, 5 * 60 * 1000);
+
+// Manual trigger for testing, guarded by the dashboard password. Optional &off=N day offset.
+app.get('/admin/run', async (req, res) => {
+  if (req.query.pw !== process.env.DASHBOARD_PASSWORD) return res.status(401).send('nope');
+  const t = req.query.task, off = req.query.off !== undefined ? parseInt(req.query.off, 10) : undefined;
+  try {
+    if (t === 'briefing') await dailyBriefing(off);
+    else if (t === 'reviews') await reviewRequests(off);
+    else if (t === 'winback') await winBackFollowups(off);
+    else return res.status(400).send('unknown task');
+    res.send('ran ' + t);
+  } catch (e) { res.status(500).send('error: ' + e.message); }
+});
+
 server.listen(PORT, () => {
   console.log(`The Leaf Busters AI assistant listening on port ${PORT}`);
 });
