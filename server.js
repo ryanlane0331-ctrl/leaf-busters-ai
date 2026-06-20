@@ -43,6 +43,10 @@ SEASONAL FALL PLAN: After you quote a single cleanup, proactively offer the fall
 
 NEIGHBOR DISCOUNT: We leave door hangers on homes near jobs we complete, offering neighbors 10% off their first cleanup. If a CALLER mentions a door hanger, the neighbor discount, or asks for a discount because we worked nearby, get their address and call verify_neighbor_discount. If it returns eligible:true, warmly confirm it ("We were just over on that street!") and pass discount:'neighbor' to compute_quote. If eligible:false, don't promise the neighbor discount — quote the normal price and you can still offer the seasonal plan. (Website visitors who scanned the door-hanger QR are already confirmed eligible — apply discount:'neighbor' without re-verifying.)
 
+REFERRAL PROGRAM (Give $20, Get $20): When a NEW customer says a friend or neighbor referred them, give them $20 off their first cleanup (pass referral_credit:20 to compute_quote) and ask who referred them — get the referrer's name (and phone if they know it) and call record_referral so that referrer earns a $20 credit toward their next cleanup. When a RETURNING customer books and lookup_customer shows referral_credit greater than 0, apply it ($20 off via referral_credit) and call redeem_referral_credit with their name/phone so it isn't reused. After a good interaction, feel free to remind customers they get $20 off for every neighbor they send our way — and the neighbor gets $20 too.
+
+SENIOR & VETERAN DISCOUNT: We give 10% off to seniors (65+) and to military veterans and active-duty service members. If a customer mentions they're a senior or a veteran — or simply offer it if it seems relevant — apply discount:'senior' or discount:'veteran' in compute_quote. Use only one percentage discount at a time (pick the best one they qualify for), but the $20 referral credit can be stacked on top of a percentage discount.
+
 RULES: Be truthful about the pricing above — never invent services or prices. Never share other customers' information. If someone has a complaint or something you truly cannot handle, take their details and say the owner will follow up. Keep it friendly and get them booked.
 
 LEAF EMERGENCY CLASSIFICATION SYSTEM: classify the caller's situation out loud — it's part of your charm — then still gather the real details (yard size, leaf load, and any sticks/branches/storm debris) to run the quote.
@@ -139,7 +143,7 @@ const sessions = new Map();
 const WEB_PROMPT = SYSTEM_PROMPT + '\n\nYou are now chatting on the website. Keep replies short and friendly (1-3 sentences). For ANY price, you MUST call the compute_quote tool and use the exact number it returns — never do the pricing math yourself. When the customer is ready to book: call check_availability (always pass the yard_size and leaf_load you used for the quote so the offered times are long enough for the job) and offer a couple of the returned times; once they pick one and you have their name, phone, and service address, call book_job (also pass yard_size and leaf_load) to lock it in, then confirm the day/time and price back to them. If they share contact info but are not ready to book, call save_lead so we can follow up. Never ask them to fill out a form — you handle everything right here in the chat. If the customer sends a photo of their yard, look at it to judge the yard size and leaf load, then call compute_quote. When a customer gives a phone number or a name, call lookup_customer — if they are a returning customer, greet them by name and apply the returning-customer discount. When booking, also ask for the customer\'s email so we can send a confirmation, and pass it to book_job.';
 
 // Deterministic pricing engine. The AI calls this via the compute_quote tool so every quote is exact.
-function computeQuote({ yard_size, acres, leaf_load = 'average', brush = 'none', gutters = 'none', extra_trucks = 0, discount = 'none' }) {
+function computeQuote({ yard_size, acres, leaf_load = 'average', brush = 'none', gutters = 'none', extra_trucks = 0, discount = 'none', referral_credit = 0 }) {
   const baseMap = { small: 120, medium: 200, large: 375, acreage: 375 };
   let base = baseMap[yard_size] ?? 200;
   if (yard_size === 'acreage' && acres && acres > 1) base = 375 + 250 * (Math.ceil(acres) - 1);
@@ -148,10 +152,12 @@ function computeQuote({ yard_size, acres, leaf_load = 'average', brush = 'none',
   price += ({ none: 0, light: 60, moderate: 125, heavy: 250 }[brush]) ?? 0;
   price += ({ none: 0, single: 90, two: 150 }[gutters]) ?? 0;
   price += (Number(extra_trucks) || 0) * 75;
-  price *= ({ none: 1, seasonal: 0.85, returning: 0.9, neighbor: 0.9 }[discount]) ?? 1;
+  price *= ({ none: 1, seasonal: 0.85, returning: 0.9, neighbor: 0.9, senior: 0.9, veteran: 0.9 }[discount]) ?? 1;
   price = Math.max(99, Math.round(price / 5) * 5);
+  const rc = Math.max(0, Number(referral_credit) || 0);
+  if (rc) price = Math.max(60, price - rc);
   const isEstimate = ['large', 'acreage'].includes(yard_size) || leaf_load === 'heavy' || gutters === 'two';
-  return { price, type: isEstimate ? 'estimate' : 'firm', inputs: { yard_size, acres, leaf_load, brush, gutters, extra_trucks, discount } };
+  return { price, type: isEstimate ? 'estimate' : 'firm', inputs: { yard_size, acres, leaf_load, brush, gutters, extra_trucks, discount, referral_credit: rc } };
 }
 
 // ---- Google (Calendar + Sheets) via service account: direct REST + self-signed JWT ----
@@ -420,15 +426,33 @@ async function lookupCustomer({ phone, name } = {}) {
   const norm = s => (s || '').replace(/\D/g, '').slice(-10);
   const np = norm(phone);
   const nm = (name || '').trim().toLowerCase();
-  for (let i = rows.length - 1; i >= 1; i--) {
+  let hit = null, info = null, earned = 0, redeemed = 0;
+  for (let i = 1; i < rows.length; i++) {
     const r = rows[i];
     const rp = norm(r[2]);
     const rn = (r[1] || '').trim().toLowerCase();
-    if ((np && rp && np === rp) || (nm && rn && nm === rn)) {
-      return { found: true, name: r[1] || '', address: r[3] || '', last_service: r[4] || '', last_status: r[9] || '' };
-    }
+    if (!((np && rp && np === rp) || (nm && rn && nm === rn))) continue;
+    hit = r;
+    if (r[3] || r[4]) info = r; // a row with real service/address details
+    const type = (r[8] || '').toLowerCase();
+    if (type.includes('referral credit earned')) earned += 20;
+    else if (type.includes('referral credit redeemed')) redeemed += 20;
   }
-  return { found: false };
+  if (!hit) return { found: false };
+  const src = info || hit;
+  return { found: true, name: src[1] || '', address: src[3] || '', last_service: src[4] || '', last_status: src[9] || '', referral_credit: Math.max(0, earned - redeemed) };
+}
+
+// Referral program: log a $20 credit for the referrer, and redemptions when applied.
+async function recordReferral({ referrer_name, referrer_phone, new_customer_name, new_customer_phone } = {}) {
+  if (!referrer_name && !referrer_phone) return { recorded: false, reason: 'need the referrer name or phone' };
+  await appendLead({ name: referrer_name || '', phone: referrer_phone || '', type: 'Referral credit earned ($20)', status: 'Credit', quote: '$20', notes: 'Referred ' + (new_customer_name || 'a new customer') + (new_customer_phone ? ' (' + new_customer_phone + ')' : '') });
+  if (process.env.ALERT_EMAIL) await sendEmail(process.env.ALERT_EMAIL, 'New referral — $20 credit owed', brandedEmail('Referral logged', escHtml(referrer_name || referrer_phone || 'A customer') + ' referred ' + escHtml(new_customer_name || 'a new customer') + '. They earned a $20 credit toward their next cleanup.', [['Referrer', referrer_name || ''], ['Referrer phone', referrer_phone || ''], ['New customer', new_customer_name || '']]));
+  return { recorded: true, note: '$20 credit logged for the referrer. Give the new customer $20 off via referral_credit:20.' };
+}
+async function redeemReferralCredit({ name, phone, amount } = {}) {
+  await appendLead({ name: name || '', phone: phone || '', type: 'Referral credit redeemed ($20)', status: 'Redeemed', quote: '-$' + (amount || 20), notes: 'Applied referral credit to a booking' });
+  return { redeemed: true };
 }
 
 // --- Neighbor discount: confirm we've worked at/near a caller's address ---
@@ -473,7 +497,8 @@ const TOOLS = [
           brush: { type: 'string', enum: ['none', 'light', 'moderate', 'heavy'] },
           gutters: { type: 'string', enum: ['none', 'single', 'two'] },
           extra_trucks: { type: 'integer' },
-          discount: { type: 'string', enum: ['none', 'seasonal', 'returning', 'neighbor'] }
+          discount: { type: 'string', enum: ['none', 'seasonal', 'returning', 'neighbor', 'senior', 'veteran'], description: 'best single discount the customer qualifies for: 10% for neighbor/returning/senior/veteran, 15% for the seasonal plan' },
+          referral_credit: { type: 'number', description: 'flat dollars off, e.g. 20, when this customer was referred by an existing customer or is redeeming their own referral credit (can apply on top of a percentage discount)' }
         },
         required: ['yard_size', 'leaf_load']
       }
@@ -548,12 +573,28 @@ const TOOLS = [
       description: "Check whether a caller qualifies for the 10% NEIGHBOR discount by confirming we have a completed or scheduled job at or near their address. Call this when a caller mentions a door hanger, the neighbor discount, or asks for a discount because we worked nearby. Returns {eligible, match, near}. Only apply discount:'neighbor' if eligible is true.",
       parameters: { type: 'object', properties: { address: { type: 'string', description: "the caller's street address" } }, required: ['address'] }
     }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'record_referral',
+      description: "Log a referral when a NEW customer says an existing customer referred them. This earns the referrer a $20 credit on their next cleanup. Pass who referred them; also give the new customer $20 off via compute_quote referral_credit:20.",
+      parameters: { type: 'object', properties: { referrer_name: { type: 'string' }, referrer_phone: { type: 'string' }, new_customer_name: { type: 'string' }, new_customer_phone: { type: 'string' } } }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'redeem_referral_credit',
+      description: "Call when a returning customer applies their own earned referral credit to a booking (lookup_customer returned referral_credit > 0). Logs the redemption so the credit isn't reused.",
+      parameters: { type: 'object', properties: { name: { type: 'string' }, phone: { type: 'string' }, amount: { type: 'number' } } }
+    }
   }
 ];
 
 // Same tools, flattened for the Realtime (voice) API.
 const REALTIME_TOOLS = TOOLS.map(t => ({ type: 'function', name: t.function.name, description: t.function.description, parameters: t.function.parameters }));
-const VOICE_PROMPT = SYSTEM_PROMPT + '\n\nTOOLS: For any price, call compute_quote and use its exact number — never do pricing math yourself. To schedule, call check_availability (pass the yard_size and leaf_load from the quote so the slot fits the job) and offer a couple of the returned times; once the caller picks one and you have their name, phone, and address, call book_job (also pass yard_size and leaf_load) to lock it in, then confirm the day, time, and price. If they share contact info but do not book, call save_lead.';
+const VOICE_PROMPT = SYSTEM_PROMPT + '\n\nTOOLS: For any price, call compute_quote and use its exact number — never do pricing math yourself. To schedule, call check_availability (pass the yard_size and leaf_load from the quote so the slot fits the job) and offer a couple of the returned times; once the caller picks one and you have their name, phone, and address, call book_job (also pass yard_size and leaf_load) to lock it in, then confirm the day, time, and price. If they share contact info but do not book, call save_lead.\n\nMANY CALLERS ARE SENIORS — this matters a lot. Speak clearly at a relaxed, patient pace and ask only ONE question at a time. Never rush, interrupt, or talk over the caller: wait until they are completely finished, and give them a beat in case they pause to think mid-sentence. Focus only on the person you are speaking with and ignore background sounds like a TV, radio, or other people talking in the room. If you are not certain you heard them correctly, or there is background noise, politely ask them to repeat or confirm rather than guessing — and always read back the address, date, and price slowly to confirm before booking.';
 
 async function runTool(name, argStr, source) {
   let args = {};
@@ -566,6 +607,8 @@ async function runTool(name, argStr, source) {
     if (name === 'save_lead') return await appendLead({ ...args, source });
     if (name === 'lookup_customer') return await lookupCustomer(args);
     if (name === 'verify_neighbor_discount') return await verifyNeighborDiscount(args);
+    if (name === 'record_referral') return await recordReferral(args);
+    if (name === 'redeem_referral_credit') return await redeemReferralCredit(args);
   } catch (e) { return { error: 'tool failed' }; }
   return { error: 'unknown tool' };
 }
@@ -583,13 +626,18 @@ app.post('/chat', async (req, res) => {
   const { sessionId, message, image, referral } = req.body || {};
   const id = (sessionId || 'anon').toString().slice(0, 80);
   const isNbr = referral && /neighbor|nbr|door|tag/i.test(String(referral));
+  const isReferral = referral && /referr|friend/i.test(String(referral));
   if (!message && !image) {
-    return res.json({ reply: isNbr
+    return res.json({ reply: isReferral
+      ? "Welcome! A neighbor sent you our way — that means $20 off your first cleanup. Tell me your address and about how big the yard is and I'll get you a price, and just let me know who referred you so they get their $20 too."
+      : isNbr
       ? "Hey neighbor! Buster here with The Leaf Busters — since you scanned our door hanger, your 10% neighbor discount is already locked in. Tell me your address and about how big the yard is and I'll get you a price."
       : "Hey! I'm Buster with The Leaf Busters. Tell me your address and about how big the yard is, and I'll get you an estimate right now." });
   }
   let history = sessions.get(id) || [{ role: 'system', content: WEB_PROMPT }];
-  if (isNbr && !history.some(h => typeof h.content === 'string' && h.content.includes('NEIGHBOR_DISCOUNT_CTX'))) {
+  if (isReferral && !history.some(h => typeof h.content === 'string' && h.content.includes('REFERRAL_CTX'))) {
+    history.push({ role: 'system', content: "REFERRAL_CTX: This visitor was referred by an existing customer and gets $20 off their first cleanup. Welcome them warmly, ask who referred them (name, and phone if they know it), call record_referral with that info so the referrer earns their $20 credit, and pass referral_credit:20 to compute_quote so the new customer's quote shows $20 off." });
+  } else if (isNbr && !history.some(h => typeof h.content === 'string' && h.content.includes('NEIGHBOR_DISCOUNT_CTX'))) {
     history.push({ role: 'system', content: "NEIGHBOR_DISCOUNT_CTX: This visitor scanned a Leaf Busters neighborhood door hanger, so they qualify for the 10% NEIGHBOR discount on their first cleanup — no verification needed. Greet them warmly as a neighbor, tell them their 10% neighbor discount is locked in, and pass discount:'neighbor' to compute_quote for every quote this session." });
   }
   const userIdx = history.length;
@@ -708,7 +756,7 @@ wss.on('connection', (twilioWs) => {
           model: REALTIME_MODEL,
           output_modalities: ['audio'],
           audio: {
-            input: { format: { type: 'audio/pcmu' }, turn_detection: { type: 'server_vad', threshold: 0.65, prefix_padding_ms: 300, silence_duration_ms: 700 } },
+            input: { format: { type: 'audio/pcmu' }, noise_reduction: { type: 'far_field' }, turn_detection: { type: 'server_vad', threshold: 0.72, prefix_padding_ms: 300, silence_duration_ms: 1300 } },
             output: { format: { type: 'audio/pcmu' }, voice: VOICE }
           },
           instructions: VOICE_PROMPT,
