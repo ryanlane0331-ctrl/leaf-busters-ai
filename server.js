@@ -216,7 +216,7 @@ async function getAvailability(opts = {}) {
   if (!getCreds()) return { error: 'calendar not configured' };
   const calId = process.env.GOOGLE_CALENDAR_ID;
   const daysOut = 14, maxSlots = 6;
-  const estimate = estimateMinutes(opts);
+  const estimate = (opts && opts.minutes) ? opts.minutes : estimateMinutes(opts);
   let busy = [];
   try {
     const d = await gfetch('https://www.googleapis.com/calendar/v3/freeBusy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ timeMin: new Date().toISOString(), timeMax: new Date(Date.now() + daysOut * 86400000).toISOString(), timeZone: BUSINESS_TZ, items: [{ id: calId }] }) });
@@ -255,19 +255,41 @@ async function appendLead(d = {}) {
   return { saved: true };
 }
 
-async function sendEmail(to, subject, html) {
+async function sendEmail(to, subject, html, attachments) {
   if (!process.env.RESEND_API_KEY || !to) return;
   const from = process.env.FROM_EMAIL || 'The Leaf Busters <onboarding@resend.dev>';
+  const payload = { from, to: [to], subject, html };
+  if (attachments && attachments.length) payload.attachments = attachments;
   try {
     await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from, to: [to], subject, html })
+      body: JSON.stringify(payload)
     });
   } catch (e) { console.error('email error', e.message); }
 }
 
 function escHtml(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+
+// --- Customer self-service + calendar helpers ---
+const MANAGE_SECRET = process.env.MANAGE_SECRET || process.env.DASHBOARD_PASSWORD || 'leafbusters-secret';
+function manageToken(eventId) { return crypto.createHmac('sha256', MANAGE_SECRET).update(String(eventId)).digest('hex').slice(0, 24); }
+function manageUrl(eventId) { return `${PUBLIC_URL}/manage?id=${encodeURIComponent(eventId)}&t=${manageToken(eventId)}`; }
+function mapLink(addr) { return 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent(addr || ''); }
+function icsStamp(d) { return new Date(d).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, ''); }
+function gcalLink(title, startISO, endISO, location, details) {
+  return 'https://calendar.google.com/calendar/render?action=TEMPLATE&text=' + encodeURIComponent(title) +
+    '&dates=' + icsStamp(startISO) + '/' + icsStamp(endISO) +
+    '&location=' + encodeURIComponent(location || '') + '&details=' + encodeURIComponent(details || '');
+}
+function icsContent(uid, title, startISO, endISO, location, details) {
+  return ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//The Leaf Busters//EN', 'CALSCALE:GREGORIAN', 'BEGIN:VEVENT',
+    'UID:' + uid + '@theleafbusters.com', 'DTSTAMP:' + icsStamp(Date.now()), 'DTSTART:' + icsStamp(startISO), 'DTEND:' + icsStamp(endISO),
+    'SUMMARY:' + String(title || '').replace(/\n/g, ' '), 'LOCATION:' + String(location || '').replace(/\n/g, ' '),
+    'DESCRIPTION:' + String(details || '').replace(/\n/g, ' '), 'END:VEVENT', 'END:VCALENDAR'].join('\r\n');
+}
+function btn(href, label) { return `<a href="${href}" style="display:inline-block;background:#d2691e;color:#fff7ec;text-decoration:none;font:700 14px Arial,sans-serif;padding:10px 16px;border-radius:8px;margin:4px 6px 4px 0">${label}</a>`; }
+function btnGhost(href, label) { return `<a href="${href}" style="display:inline-block;background:transparent;color:#ec7a1e;text-decoration:none;font:700 14px Arial,sans-serif;padding:10px 16px;border:1px solid #6e451f;border-radius:8px;margin:4px 6px 4px 0">${label}</a>`; }
 
 // Branded HTML email matching theleafbusters.com (dark theme, cream wordmark, burnt-orange accents).
 function brandedEmail(heading, introHtml, rows, footerNote) {
@@ -301,7 +323,8 @@ function brandedEmail(heading, introHtml, rows, footerNote) {
   </td></tr></table></body></html>`;
 }
 
-async function sendBookingEmails(a, when) {
+async function sendBookingEmails(a, when, ctx) {
+  ctx = ctx || {};
   const price = a.quote || 'We will confirm';
   const alertTo = process.env.ALERT_EMAIL;
   if (alertTo) await sendEmail(alertTo, `New booking: ${a.name || 'Customer'} — ${when}`,
@@ -309,11 +332,19 @@ async function sendBookingEmails(a, when) {
       ['When', when], ['Name', a.name || ''], ['Phone', a.phone || ''], ['Email', a.email || ''],
       ['Address', a.address || ''], ['Service', a.service || 'Leaf cleanup'], ['Quote', price, true],
       ['Notes', a.notes || '—']
-    ], ''));
-  if (a.email) await sendEmail(a.email, 'Your Leaf Busters cleanup is booked',
-    brandedEmail("You're booked! 🍂", `Hi ${escHtml(a.name || 'there')}, thanks for choosing The Leaf Busters — your cleanup is on the schedule. Here's what to expect:`, [
-      ['When', when], ['Address', a.address || ''], ['Service', a.service || 'Leaf cleanup'], ['Price', price, true]
-    ], 'No need to be home — just make sure the yard is accessible. Payment is due when the job is done. Need to reschedule for weather? It\'s free; reply to this email or give us a call.'));
+    ], a.address ? btnGhost(mapLink(a.address), 'View on map') : ''));
+  if (a.email) {
+    let actions = '';
+    if (ctx.startISO && ctx.endISO) actions += btn(gcalLink('Leaf Busters cleanup', ctx.startISO, ctx.endISO, a.address, 'The Leaf Busters — ' + (a.service || 'Leaf cleanup')), 'Add to calendar');
+    if (a.address) actions += btn(mapLink(a.address), 'Directions');
+    if (ctx.eventId) actions += btnGhost(manageUrl(ctx.eventId), 'Reschedule / cancel');
+    const foot = actions + '<div style="margin-top:12px">No need to be home — just make sure the yard is accessible. Payment is due when the job\'s done. Weather reschedules are free.</div>';
+    const atts = (ctx.startISO && ctx.endISO) ? [{ filename: 'leaf-busters-cleanup.ics', content: Buffer.from(icsContent(ctx.eventId || 'lb', 'Leaf Busters cleanup', ctx.startISO, ctx.endISO, a.address, a.service || 'Leaf cleanup')).toString('base64') }] : undefined;
+    await sendEmail(a.email, 'Your Leaf Busters cleanup is booked',
+      brandedEmail("You're booked! 🍂", `Hi ${escHtml(a.name || 'there')}, thanks for choosing The Leaf Busters — your cleanup is on the schedule. Here's what to expect:`, [
+        ['When', when], ['Address', a.address || ''], ['Service', a.service || 'Leaf cleanup'], ['Price', price, true]
+      ], foot), atts);
+  }
 }
 
 async function bookJob(a = {}) {
@@ -323,11 +354,13 @@ async function bookJob(a = {}) {
   const jobMin = estimateMinutes(a);
   const end = new Date(start.getTime() + jobMin * 60000);
   const when = start.toLocaleString('en-US', { timeZone: BUSINESS_TZ, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  let eventId = '';
   try {
-    await gfetch(`https://www.googleapis.com/calendar/v3/calendars/${id}/events`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ summary: `Leaf cleanup — ${a.name || 'Customer'} (~${jobMin} min)`, description: `Service: ${a.service || ''}\nQuote: ${a.quote || ''}\nEst. time: ${jobMin} min (+1h buffer)\nPhone: ${a.phone || ''}\nEmail: ${a.email || ''}\nNotes: ${a.notes || ''}`, location: a.address || '', start: { dateTime: start.toISOString(), timeZone: BUSINESS_TZ }, end: { dateTime: end.toISOString(), timeZone: BUSINESS_TZ } }) });
+    const ev = await gfetch(`https://www.googleapis.com/calendar/v3/calendars/${id}/events`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ summary: `Leaf cleanup — ${a.name || 'Customer'} (~${jobMin} min)`, description: `Service: ${a.service || ''}\nQuote: ${a.quote || ''}\nEst. time: ${jobMin} min (+1h buffer)\nPhone: ${a.phone || ''}\nEmail: ${a.email || ''}\nNotes: ${a.notes || ''}`, location: a.address || '', start: { dateTime: start.toISOString(), timeZone: BUSINESS_TZ }, end: { dateTime: end.toISOString(), timeZone: BUSINESS_TZ } }) });
+    eventId = (ev && ev.id) ? ev.id : '';
   } catch (e) { console.error('book error', e.message); return { error: 'could not book' }; }
   await appendLead({ ...a, status: 'Booked', notes: `${a.notes || ''} | booked ${when}` });
-  await sendBookingEmails(a, when);
+  await sendBookingEmails(a, when, { eventId: eventId, startISO: start.toISOString(), endISO: end.toISOString() });
   return { booked: true, when };
 }
 
@@ -660,6 +693,7 @@ async function getEventsForDay(offset) {
       return {
         time: new Date(ev.start.dateTime).toLocaleString('en-US', { timeZone: BUSINESS_TZ, weekday: 'short', hour: 'numeric', minute: '2-digit' }),
         location: ev.location || fld(desc, 'Address') || '',
+        id: ev.id || '',
         email: (desc.match(/Email:\s*([^\s|]+@[^\s|]+)/) || [])[1] || '',
         name: (ev.summary || '').replace(/^Leaf cleanup\s*[—-]\s*/, '').replace(/\s*\(.*\)$/, '').trim() || 'there',
         quote: fld(desc, 'Quote'),
@@ -726,11 +760,28 @@ async function winBackFollowups(off) {
   console.error('winback sent', n);
 }
 
-let _ranBrief = '', _ranEve = '';
+async function customerReminders(off) {
+  off = (off === undefined) ? 1 : off;
+  const ev = await getEventsForDay(off);
+  let n = 0;
+  for (const e of ev) {
+    if (!e.email) continue;
+    const foot = (e.location ? btn(mapLink(e.location), 'Directions') : '') + (e.id ? btnGhost(manageUrl(e.id), 'Reschedule / cancel') : '') +
+      '<div style="margin-top:12px">See you then! No need to be home — just keep the yard accessible. Payment is due when the job\'s done.</div>';
+    await sendEmail(e.email, 'Reminder: your Leaf Busters cleanup is tomorrow',
+      brandedEmail('Cleanup reminder 🍂', `Hi ${escHtml(e.name)}, friendly reminder from Leaf Busters Dispatch — Buck is scheduled to take care of your yard tomorrow.`,
+        [['When', e.time], ['Address', e.location || ''], ['Service', e.service || 'Leaf cleanup']], foot));
+    n++;
+  }
+  console.error('reminders sent', n);
+}
+
+let _ranBrief = '', _ranEve = '', _ranRem = '';
 setInterval(async () => {
   try {
     const { ymd: today, hour } = chiNow();
     if (hour === 6 && _ranBrief !== today) { _ranBrief = today; await dailyBriefing(0); }
+    if (hour === 17 && _ranRem !== today) { _ranRem = today; await customerReminders(1); }
     if (hour === 18 && _ranEve !== today) { _ranEve = today; await reviewRequests(-1); await winBackFollowups(-1); }
   } catch (e) { console.error('scheduler error', e.message); }
 }, 5 * 60 * 1000);
@@ -743,9 +794,78 @@ app.get('/admin/run', async (req, res) => {
     if (t === 'briefing') await dailyBriefing(off);
     else if (t === 'reviews') await reviewRequests(off);
     else if (t === 'winback') await winBackFollowups(off);
+    else if (t === 'reminders') await customerReminders(off);
     else return res.status(400).send('unknown task');
     res.send('ran ' + t);
   } catch (e) { res.status(500).send('error: ' + e.message); }
+});
+
+// ---------------------------------------------------------------------------
+// Customer self-service: reschedule or cancel from a tokenized link in emails.
+// ---------------------------------------------------------------------------
+async function getEventById(id) {
+  const cid = encodeURIComponent(process.env.GOOGLE_CALENDAR_ID);
+  return gfetch(`https://www.googleapis.com/calendar/v3/calendars/${cid}/events/${encodeURIComponent(id)}`);
+}
+function managePage(title, bodyHtml) {
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title} — The Leaf Busters</title></head>
+  <body style="margin:0;background:#100e0c;font-family:Arial,Helvetica,sans-serif;color:#f4eee0">
+  <div style="max-width:560px;margin:0 auto;padding:34px 18px">
+    <div style="text-align:center;margin-bottom:18px"><img src="${PUBLIC_URL}/logo.jpg" width="160" alt="The Leaf Busters" style="width:160px;max-width:62%"></div>
+    <div style="background:#1b1714;border:1px solid rgba(236,224,196,.15);border-radius:16px;padding:26px 22px">${bodyHtml}</div>
+    <div style="text-align:center;color:#8a6a3f;font-size:12px;margin-top:16px">theleafbusters.com &bull; (844) 352-9136</div>
+  </div></body></html>`;
+}
+app.get('/manage', async (req, res) => {
+  const id = req.query.id, t = req.query.t;
+  if (!id || t !== manageToken(id)) return res.status(403).send(managePage('Link expired', '<p>This link is invalid or expired. Please call (844) 352-9136 and Buster will help.</p>'));
+  try {
+    const ev = await getEventById(id);
+    if (!ev || ev.status === 'cancelled') return res.send(managePage('Canceled', '<h2 style="color:#f3ead2;margin-top:0">This appointment is canceled.</h2><p>Need a new cleanup? <a href="https://theleafbusters.com" style="color:#ec7a1e">Book here</a>.</p>'));
+    const when = (ev.start && ev.start.dateTime) ? new Date(ev.start.dateTime).toLocaleString('en-US', { timeZone: BUSINESS_TZ, weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '';
+    if (req.query.view === 'reschedule') {
+      const durMin = (ev.start && ev.end) ? Math.round((new Date(ev.end) - new Date(ev.start)) / 60000) : 120;
+      const av = await getAvailability({ minutes: durMin });
+      const slots = (av.slots || []).map(s => `<div style="margin:8px 0">${btn(`${PUBLIC_URL}/manage/reschedule?id=${encodeURIComponent(id)}&t=${t}&start=${encodeURIComponent(s.start_iso)}`, s.label)}</div>`).join('') || '<p>No openings found right now — please call (844) 352-9136.</p>';
+      return res.send(managePage('Reschedule', `<h2 style="color:#f3ead2;margin-top:0">Pick a new time</h2><p style="color:#c9b896">Current: ${escHtml(when)}</p>${slots}<p style="margin-top:16px">${btnGhost(manageUrl(id), 'Back')}</p>`));
+    }
+    if (req.query.cancel === '1') {
+      return res.send(managePage('Cancel', `<h2 style="color:#f3ead2;margin-top:0">Cancel this cleanup?</h2><p style="color:#c9b896">${escHtml(when)}<br>${escHtml(ev.location || '')}</p><p style="margin-top:18px">${btn(`${PUBLIC_URL}/manage/cancel?id=${encodeURIComponent(id)}&t=${t}&confirm=1`, 'Yes, cancel it')} ${btnGhost(manageUrl(id), 'Keep it')}</p>`));
+    }
+    res.send(managePage('Your appointment', `<h2 style="color:#f3ead2;margin-top:0">Your cleanup</h2>
+      <p style="color:#c9b896;font-size:16px"><b style="color:#f4eee0">${escHtml(when)}</b><br>${escHtml(ev.location || '')}</p>
+      <p style="margin-top:18px">${btn(`${PUBLIC_URL}/manage?id=${encodeURIComponent(id)}&t=${t}&view=reschedule`, 'Reschedule')} ${btnGhost(`${PUBLIC_URL}/manage?id=${encodeURIComponent(id)}&t=${t}&cancel=1`, 'Cancel')}</p>`));
+  } catch (e) { res.status(500).send(managePage('Error', '<p>Something went wrong. Please call (844) 352-9136.</p>')); }
+});
+app.get('/manage/cancel', async (req, res) => {
+  const id = req.query.id, t = req.query.t;
+  if (!id || t !== manageToken(id) || req.query.confirm !== '1') return res.status(403).send(managePage('Invalid', '<p>Invalid link.</p>'));
+  try {
+    const ev = await getEventById(id).catch(() => null);
+    const cid = encodeURIComponent(process.env.GOOGLE_CALENDAR_ID);
+    await gfetch(`https://www.googleapis.com/calendar/v3/calendars/${cid}/events/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    const email = ev ? ((ev.description || '').match(/Email:\s*([^\s|]+@[^\s|]+)/) || [])[1] : '';
+    const when = (ev && ev.start && ev.start.dateTime) ? new Date(ev.start.dateTime).toLocaleString('en-US', { timeZone: BUSINESS_TZ, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '';
+    if (email) await sendEmail(email, 'Your Leaf Busters cleanup is canceled', brandedEmail('Cleanup canceled', `Your cleanup${when ? ' on ' + escHtml(when) : ''} has been canceled — no charge. Changed your mind?`, [], btn('https://theleafbusters.com', 'Book again')));
+    if (process.env.ALERT_EMAIL) await sendEmail(process.env.ALERT_EMAIL, `Canceled: ${ev ? ev.summary : 'a cleanup'} ${when}`, brandedEmail('A booking was canceled', `${escHtml(ev ? ev.summary : 'A cleanup')}${when ? ' — ' + escHtml(when) : ''} was canceled by the customer.`, [], ''));
+    res.send(managePage('Canceled', '<h2 style="color:#f3ead2;margin-top:0">You\'re all set — canceled.</h2><p>No charge. Need us again? <a href="https://theleafbusters.com" style="color:#ec7a1e">Book anytime</a>.</p>'));
+  } catch (e) { res.status(500).send(managePage('Error', '<p>Couldn\'t cancel — please call (844) 352-9136.</p>')); }
+});
+app.get('/manage/reschedule', async (req, res) => {
+  const id = req.query.id, t = req.query.t, start = req.query.start;
+  if (!id || t !== manageToken(id) || !start) return res.status(403).send(managePage('Invalid', '<p>Invalid link.</p>'));
+  try {
+    const ev = await getEventById(id);
+    const durMin = (ev.start && ev.end) ? Math.round((new Date(ev.end) - new Date(ev.start)) / 60000) : 120;
+    const ns = new Date(start), ne = new Date(ns.getTime() + durMin * 60000);
+    const cid = encodeURIComponent(process.env.GOOGLE_CALENDAR_ID);
+    await gfetch(`https://www.googleapis.com/calendar/v3/calendars/${cid}/events/${encodeURIComponent(id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ start: { dateTime: ns.toISOString(), timeZone: BUSINESS_TZ }, end: { dateTime: ne.toISOString(), timeZone: BUSINESS_TZ } }) });
+    const when = ns.toLocaleString('en-US', { timeZone: BUSINESS_TZ, weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+    const email = ((ev.description || '').match(/Email:\s*([^\s|]+@[^\s|]+)/) || [])[1];
+    if (email) await sendEmail(email, 'Your Leaf Busters cleanup was rescheduled', brandedEmail('Rescheduled ✅', 'You\'re all set — your cleanup is now:', [['When', when], ['Address', ev.location || '']], btn(gcalLink('Leaf Busters cleanup', ns.toISOString(), ne.toISOString(), ev.location, 'The Leaf Busters'), 'Add to calendar') + btnGhost(manageUrl(id), 'Manage')));
+    if (process.env.ALERT_EMAIL) await sendEmail(process.env.ALERT_EMAIL, `Rescheduled: ${ev.summary} → ${when}`, brandedEmail('A booking was rescheduled', `${escHtml(ev.summary)} is now ${escHtml(when)}.`, [], ''));
+    res.send(managePage('Rescheduled', `<h2 style="color:#f3ead2;margin-top:0">Rescheduled!</h2><p style="color:#c9b896">Your cleanup is now <b style="color:#f4eee0">${escHtml(when)}</b>. A confirmation is on its way.</p>`));
+  } catch (e) { res.status(500).send(managePage('Error', '<p>Couldn\'t reschedule — please call (844) 352-9136.</p>')); }
 });
 
 server.listen(PORT, () => {
