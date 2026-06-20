@@ -39,6 +39,8 @@ Give a FIRM price for Small or Medium yards with Light or Average leaf load. For
 
 TO BOOK A JOB: collect the caller's name, phone number, and service address, and which service they want. Offer the next couple of openings as windows (like "tomorrow morning" or "Thursday afternoon"), never an exact minute. Confirm the price, date, and address back to them. Ask for their email so we can send a confirmation; never say "text". Tell them payment is due when the job is done. Reschedule weather days for free. Buck is the person who shows up and personally does every cleanup — if anyone asks who's coming or who'll be doing the work, let them know Buck will take care of their yard.
 
+SEASONAL FALL PLAN: After you quote a single cleanup, proactively offer the fall plan — all the season's cleanups (usually 3, spaced about every 3-4 weeks) at 15% off every visit — e.g., "Want me to lock in all three fall cleanups and save you 15%?" If they go for it, get the first opening from check_availability and call book_season (it schedules all the visits and applies the discount automatically), then confirm the dates and the per-visit price. Use book_season for the plan; use book_job only for a single one-time cleanup.
+
 RULES: Be truthful about the pricing above — never invent services or prices. Never share other customers' information. If someone has a complaint or something you truly cannot handle, take their details and say the owner will follow up. Keep it friendly and get them booked.
 
 LEAF EMERGENCY CLASSIFICATION SYSTEM: classify the caller's situation out loud — it's part of your charm — then still gather the real details (yard size, leaf load, and any sticks/branches/storm debris) to run the quote.
@@ -369,6 +371,38 @@ async function bookJob(a = {}) {
   return { booked: true, when };
 }
 
+// Recurring fall plan: book several cleanups across the season at the 15% seasonal discount.
+async function bookSeason(a = {}) {
+  if (!getCreds()) return { error: 'calendar not configured' };
+  const id = encodeURIComponent(process.env.GOOGLE_CALENDAR_ID);
+  const visits = Math.max(2, Math.min(5, a.visits || 3));
+  const interval = a.interval_days || 24;
+  const jobMin = estimateMinutes(a);
+  const q = computeQuote({ yard_size: a.yard_size, acres: a.acres, leaf_load: a.leaf_load, brush: a.brush, gutters: a.gutters, discount: 'seasonal' });
+  const per = q.price, total = per * visits;
+  const dates = []; let firstId = '';
+  for (let v = 0; v < visits; v++) {
+    let start = new Date(new Date(a.start_iso).getTime() + v * interval * 86400000);
+    if (weekday(start.toLocaleDateString('en-CA', { timeZone: BUSINESS_TZ })) === 'Sunday') start = new Date(start.getTime() + 86400000);
+    const end = new Date(start.getTime() + jobMin * 60000);
+    const when = start.toLocaleString('en-US', { timeZone: BUSINESS_TZ, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+    dates.push({ when: when, startISO: start.toISOString() });
+    try {
+      const ev = await gfetch(`https://www.googleapis.com/calendar/v3/calendars/${id}/events`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ summary: `Leaf cleanup — ${a.name || 'Customer'} (Fall plan ${v + 1}/${visits}, ~${jobMin} min)`, description: `Seasonal plan ${v + 1} of ${visits}\nService: ${a.service || 'Leaf cleanup'}\nPer-visit: $${per}\nPhone: ${a.phone || ''}\nEmail: ${a.email || ''}\nNotes: ${a.notes || ''}`, location: a.address || '', start: { dateTime: start.toISOString(), timeZone: BUSINESS_TZ }, end: { dateTime: end.toISOString(), timeZone: BUSINESS_TZ } }) });
+      if (v === 0 && ev && ev.id) firstId = ev.id;
+    } catch (e) { console.error('season book error', e.message); return { error: 'could not book plan' }; }
+  }
+  await appendLead({ ...a, status: 'Booked', type: `Seasonal plan (${visits} visits)`, quote: `$${per}/visit`, notes: `${a.notes || ''} | fall plan ${visits}x: ` + dates.map(d => d.when).join('; ') });
+  const rows = dates.map((d, i) => ['Visit ' + (i + 1), d.when]);
+  rows.push(['Per visit', '$' + per, true]); rows.push(['Plan total', '$' + total]);
+  if (process.env.ALERT_EMAIL) await sendEmail(process.env.ALERT_EMAIL, `New fall plan: ${a.name || 'Customer'} (${visits} visits)`, brandedEmail('New seasonal plan booked', `${escHtml(a.name || 'Customer')} signed up for a ${visits}-visit fall plan.`, rows.concat([['Name', a.name || ''], ['Phone', a.phone || ''], ['Address', a.address || '']]), a.address ? btnGhost(mapLink(a.address), 'View on map') : ''));
+  if (a.email) {
+    const foot = (firstId ? btnGhost(manageUrl(firstId), 'Manage first visit') : '') + (a.address ? btn(mapLink(a.address), 'Directions') : '') + '<div style="margin-top:12px">You\'re saving 15% with the fall plan. No need to be home — just keep the yard accessible. Payment is due after each visit, and weather days reschedule free.</div>';
+    await sendEmail(a.email, 'Your Leaf Busters fall plan is booked', brandedEmail("Fall plan locked in! 🍂", `Hi ${escHtml(a.name || 'there')}, you're set with ${visits} cleanups this fall at 15% off each — here's the schedule:`, rows, foot));
+  }
+  return { booked: true, visits: visits, per_visit: per, total: total, dates: dates.map(d => d.when) };
+}
+
 async function readLeads() {
   if (!getCreds()) return [];
   try {
@@ -439,6 +473,25 @@ const TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'book_season',
+      description: 'Book the discounted multi-visit FALL PLAN (default 3 cleanups across the season, 15% off each visit). Use this instead of book_job when the customer wants the seasonal package. Needs the first slot start_iso (from check_availability), name, phone, address, and the yard_size/leaf_load used for the quote.',
+      parameters: {
+        type: 'object',
+        properties: {
+          start_iso: { type: 'string', description: 'first visit start_iso from check_availability' },
+          name: { type: 'string' }, phone: { type: 'string' }, address: { type: 'string' },
+          yard_size: { type: 'string', enum: ['small', 'medium', 'large', 'acreage'] }, leaf_load: { type: 'string', enum: ['light', 'average', 'heavy'] }, acres: { type: 'number' },
+          brush: { type: 'string' }, gutters: { type: 'string' },
+          visits: { type: 'number', description: 'number of visits, default 3' }, interval_days: { type: 'number', description: 'days between visits, default 24' },
+          email: { type: 'string' }, service: { type: 'string' }, notes: { type: 'string' }
+        },
+        required: ['start_iso', 'name', 'phone', 'address', 'yard_size']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'save_lead',
       description: 'Save a lead when the customer shares contact info but is not booking yet, so we can follow up.',
       parameters: {
@@ -472,6 +525,7 @@ async function runTool(name, argStr, source) {
     if (name === 'compute_quote') return computeQuote(args);
     if (name === 'check_availability') return await getAvailability(args);
     if (name === 'book_job') return await bookJob({ ...args, source });
+    if (name === 'book_season') return await bookSeason({ ...args, source });
     if (name === 'save_lead') return await appendLead({ ...args, source });
     if (name === 'lookup_customer') return await lookupCustomer(args);
   } catch (e) { return { error: 'tool failed' }; }
