@@ -70,6 +70,11 @@ const PUBLIC_URL = (process.env.PUBLIC_URL || 'https://leaf-busters-ai.onrender.
 let LOGO_BUF = null;
 try { LOGO_BUF = fs.readFileSync('email_logo.jpg'); } catch (e) { console.error('logo load', e.message); }
 app.get('/logo.jpg', (req, res) => { if (!LOGO_BUF) return res.sendStatus(404); res.set('Cache-Control', 'public, max-age=86400'); res.type('jpeg').send(LOGO_BUF); });
+// Realistic leaf cut-outs for the homepage animation.
+for (let _i = 1; _i <= 12; _i++) {
+  let _buf = null; try { _buf = fs.readFileSync('leaf' + _i + '.png'); } catch (e) {}
+  app.get('/leaf' + _i + '.png', (req, res) => { if (!_buf) return res.sendStatus(404); res.set('Cache-Control', 'public, max-age=604800'); res.type('png').send(_buf); });
+}
 
 // Non-secret diagnostic: which service account + calendar the server uses.
 app.get('/whoami', (req, res) => {
