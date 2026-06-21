@@ -327,11 +327,11 @@ function brandedEmail(heading, introHtml, rows, footerNote) {
         <h1 style="margin:0 0 10px;color:#f3ead2;font:700 22px/1.25 'Arial Narrow',Arial,sans-serif;letter-spacing:.5px">${heading}</h1>
         <div style="color:#c9b896;font:400 15px/1.6 Arial,sans-serif">${introHtml}</div>
       </td></tr>
-      <tr><td style="padding:16px 30px 4px">
+      ${rows.length ? `<tr><td style="padding:16px 30px 4px">
         <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#211b16;border:1px solid rgba(236,224,196,.12);border-radius:12px">
           <tr><td style="padding:6px 18px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0">${rowHtml}</table></td></tr>
         </table>
-      </td></tr>
+      </td></tr>` : ''}
       ${footerNote ? `<tr><td style="padding:16px 30px 4px;color:#c9b896;font:400 13px/1.6 Arial,sans-serif">${footerNote}</td></tr>` : ''}
       <tr><td align="center" style="padding:22px 30px 28px">
         <a href="tel:+18443529136" style="color:#ec7a1e;text-decoration:none;font:700 16px Arial,sans-serif">(844) 352-9136</a>
@@ -705,12 +705,17 @@ function renderDashboard(leads, events) {
   }).join('');
   const leadRows = rows.map(r => `<tr>${header.map((_, i) => `<td>${esc(r[i] || '')}</td>`).join('')}</tr>`).join('');
 
-  // Contacts: unique customers we have done work for (booked), for marketing.
   const cmap = {};
+  let bookedRows = 0, revenue = 0;
+  const allEmailSet = new Set();
   for (let k = 1; k < leads.length; k++) {
     const r = leads[k];
+    const em0 = ((r[11] || '').match(/Email:\s*([^\s|]+@[^\s|]+)/) || [])[1];
+    if (em0) allEmailSet.add(em0.toLowerCase());
     if ((r[9] || '').toLowerCase().indexOf('booked') < 0) continue;
-    const email = ((r[11] || '').match(/Email:\s*([^\s|]+@[^\s|]+)/) || [])[1] || '';
+    bookedRows++;
+    const qm = (r[7] || '').match(/\$?\s*([0-9][0-9,]*)/); if (qm) revenue += (parseInt(qm[1].replace(/,/g, ''), 10) || 0);
+    const email = em0 || '';
     const phone = (r[2] || '').trim();
     const name = (r[1] || '').trim();
     const key = phone.replace(/[^0-9]/g, '') || email.toLowerCase() || name.toLowerCase();
@@ -727,6 +732,9 @@ function renderDashboard(leads, events) {
   const emails = contacts.map(c => c.email).filter(Boolean);
   const phones = contacts.map(c => c.phone).filter(Boolean);
   const csv = ['Name,Phone,Email,Address,Jobs,Last service'].concat(contacts.map(c => [c.name, c.phone, c.email, c.address, c.jobs, c.last].map(x => `"${String(x == null ? '' : x).replace(/"/g, '""')}"`).join(','))).join('\n');
+  const bookedEmailCount = new Set(emails.map(e => e.toLowerCase())).size;
+  const allEmailCount = allEmailSet.size;
+  const conv = rows.length ? Math.round(bookedRows / rows.length * 100) : 0;
 
   const calId = process.env.GOOGLE_CALENDAR_ID || '';
   const calSrc = calId ? ('https://calendar.google.com/calendar/embed?src=' + encodeURIComponent(calId) + '&ctz=' + encodeURIComponent(BUSINESS_TZ)) : '';
@@ -739,15 +747,32 @@ th,td{padding:9px 11px;text-align:left;border-bottom:1px solid rgba(236,224,196,
 th{background:#2f5233;color:#f3ede0;font-size:12px;text-transform:uppercase;letter-spacing:.5px}
 tr:hover td{background:rgba(210,105,30,.06)}.empty{color:#c9b896;padding:14px 0}
 .count{background:#d2691e;color:#fff7ec;border-radius:20px;padding:1px 9px;font-size:13px;margin-left:6px}
+.stats{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin:16px 0 6px}
+.stat{background:#1b1714;border:1px solid rgba(236,224,196,.12);border-radius:10px;padding:12px 14px}
+.stat .n{font-size:22px;color:#ec7a1e;font-weight:600}.stat .l{font-size:12px;color:#c9b896;margin-top:2px}
 .tabs{display:flex;gap:8px;margin:18px 0 6px;flex-wrap:wrap}
 .tab{background:#1b1714;color:#c9b896;border:1px solid rgba(236,224,196,.2);padding:9px 16px;border-radius:8px;cursor:pointer;font-size:14px}
 .tab.active{background:#2f5233;color:#f3ede0;border-color:#2f5233}
 .exports{display:flex;gap:8px;margin:10px 0 14px;flex-wrap:wrap}
 .exports button{background:#d2691e;color:#fff7ec;border:0;padding:9px 15px;border-radius:8px;cursor:pointer;font-size:13px}
-.exports button:hover{background:#ec7a1e}</style></head>
+.exports button:hover{background:#ec7a1e}
+.form-row{margin:10px 0}.form-row label{display:block;font-size:13px;color:#c9b896;margin-bottom:4px}
+.form-row input[type=text],.form-row textarea,.form-row select{width:100%;max-width:680px;background:#100e0c;border:1px solid rgba(236,224,196,.2);border-radius:8px;color:#f4eee0;padding:10px;font-family:inherit;font-size:14px;box-sizing:border-box}
+.form-row textarea{min-height:150px;resize:vertical}
+.btn-send{background:#d2691e;color:#fff7ec;border:0;padding:11px 18px;border-radius:8px;cursor:pointer;font-size:14px}.btn-send:hover{background:#ec7a1e}
+@media(max-width:800px){.stats{grid-template-columns:repeat(2,1fr)}}</style></head>
 <body><h1>The Leaf Busters — Dashboard</h1><div class="sub">Live from your calendar &amp; leads sheet. Reload to refresh.</div>
+<div class="stats">
+  <div class="stat"><div class="n">${contacts.length}</div><div class="l">Customers</div></div>
+  <div class="stat"><div class="n">${bookedRows}</div><div class="l">Booked jobs</div></div>
+  <div class="stat"><div class="n">${rows.length}</div><div class="l">Total leads</div></div>
+  <div class="stat"><div class="n">${conv}%</div><div class="l">Booking rate</div></div>
+  <div class="stat"><div class="n">$${revenue.toLocaleString()}</div><div class="l">Est. booked revenue</div></div>
+  <div class="stat"><div class="n">${events.length}</div><div class="l">Upcoming</div></div>
+</div>
 <div class="tabs">
   <button class="tab active" data-t="contacts">Contacts <span class="count">${contacts.length}</span></button>
+  <button class="tab" data-t="promo">Promo email</button>
   <button class="tab" data-t="bookings">Upcoming <span class="count">${events.length}</span></button>
   <button class="tab" data-t="calendar">Calendar</button>
   <button class="tab" data-t="leads">Leads &amp; quotes <span class="count">${rows.length}</span></button>
@@ -760,6 +785,19 @@ tr:hover td{background:rgba(210,105,30,.06)}.empty{color:#c9b896;padding:14px 0}
     <button onclick="downloadCsv()">Download CSV</button>
   </div>
   ${contacts.length ? `<table><tr><th>Name</th><th>Phone</th><th>Email</th><th>Address</th><th>Jobs</th><th>Last service</th></tr>${contactRows}</table>` : '<div class="empty">No customers yet — this fills in automatically as you book and complete jobs.</div>'}
+</section>
+<section id="tab-promo" class="panel" style="display:none">
+  <div class="sub">Compose a promotion and email it to your customers. (Text blasts unlock once your number is verified.)</div>
+  <div class="form-row"><label>Send to</label>
+    <select id="blastAudience">
+      <option value="booked">Past customers (${bookedEmailCount} with email)</option>
+      <option value="all">Everyone who got a quote (${allEmailCount} with email)</option>
+    </select>
+  </div>
+  <div class="form-row"><label>Subject</label><input type="text" id="blastSubject" placeholder="Fall cleanup — book now &amp; save"></div>
+  <div class="form-row"><label>Message</label><textarea id="blastBody" placeholder="Hi! The leaves are really coming down — book your fall cleanup this week and ..."></textarea></div>
+  <button class="btn-send" onclick="sendBlast(this)">Send email</button>
+  <div id="blastResult" class="sub" style="margin-top:10px"></div>
 </section>
 <section id="tab-bookings" class="panel" style="display:none">
   ${events.length ? `<table><tr><th>When</th><th>Job</th><th>Address</th><th>Details</th></tr>${evRows}</table>` : '<div class="empty">No upcoming bookings yet.</div>'}
@@ -779,6 +817,17 @@ document.querySelectorAll('.tab').forEach(function(b){b.onclick=function(){
   document.getElementById('tab-'+b.getAttribute('data-t')).style.display='';};});
 function copyText(t,btn){if(!t){return;}navigator.clipboard.writeText(t).then(function(){var o=btn.textContent;btn.textContent='Copied!';setTimeout(function(){btn.textContent=o;},1200);});}
 function downloadCsv(){var a=document.createElement('a');a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(CSV);a.download='leaf-busters-contacts.csv';document.body.appendChild(a);a.click();a.remove();}
+function sendBlast(btn){
+  var subject=document.getElementById('blastSubject').value.trim();
+  var message=document.getElementById('blastBody').value.trim();
+  var sel=document.getElementById('blastAudience');var audience=sel.value;
+  if(!subject||!message){alert('Add a subject and a message first.');return;}
+  if(!confirm('Send this email to '+sel.selectedOptions[0].textContent+'?'))return;
+  btn.disabled=true;var o=btn.textContent;btn.textContent='Sending...';
+  fetch('/dashboard/send-blast',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subject:subject,message:message,audience:audience})})
+   .then(function(r){return r.json();}).then(function(d){document.getElementById('blastResult').textContent=d.error?('Error: '+d.error):('Sent to '+d.sent+' of '+d.recipients+' contacts.');btn.disabled=false;btn.textContent=o;})
+   .catch(function(e){document.getElementById('blastResult').textContent='Error sending — try again.';btn.disabled=false;btn.textContent=o;});
+}
 </script>
 </body></html>`;
 }
@@ -797,6 +846,28 @@ app.get('/dashboard', dashAuth, async (req, res) => {
     } catch (e) { console.error('dash cal', e.message); }
   }
   res.send(renderDashboard(leads, events));
+});
+
+app.post('/dashboard/send-blast', dashAuth, async (req, res) => {
+  const subject = (req.body && req.body.subject || '').trim();
+  const message = (req.body && req.body.message || '').trim();
+  const audience = (req.body && req.body.audience) || 'booked';
+  if (!subject || !message) return res.status(400).json({ error: 'Subject and message are required.' });
+  let rows = [];
+  try { rows = await readLeads(); } catch (e) { return res.status(500).json({ error: 'Could not read contacts.' }); }
+  const set = new Set();
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    if (audience === 'booked' && (r[9] || '').toLowerCase().indexOf('booked') < 0) continue;
+    const em = ((r[11] || '').match(/Email:\s*([^\s|]+@[^\s|]+)/) || [])[1];
+    if (em) set.add(em.toLowerCase());
+  }
+  const list = Array.from(set);
+  const html = brandedEmail(subject, escHtml(message).replace(/\n/g, '<br>'), [],
+    '<a href="https://theleafbusters.com" style="display:inline-block;background:#d2691e;color:#fff7ec;text-decoration:none;font:700 16px Arial,sans-serif;padding:12px 22px;border-radius:8px">Book a cleanup</a><div style="margin-top:14px;color:#8a6a3f;font-size:12px">You are receiving this because you are a Leaf Busters customer. Reply to this email to unsubscribe.</div>');
+  let sent = 0;
+  for (const em of list) { try { await sendEmail(em, subject, html); sent++; } catch (e) { console.error('blast', em, e.message); } }
+  res.json({ recipients: list.length, sent });
 });
 
 // ---------------------------------------------------------------------------
