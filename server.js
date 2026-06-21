@@ -1066,6 +1066,22 @@ app.get('/admin/run', async (req, res) => {
   } catch (e) { res.status(500).send('error: ' + e.message); }
 });
 
+// One-time: grant a Google account access to the booking calendar so it shows in
+// the dashboard embed and in that person's own Google Calendar.
+app.get('/admin/share-calendar', async (req, res) => {
+  if (req.query.pw !== process.env.DASHBOARD_PASSWORD) return res.status(401).send('nope');
+  if (!getCreds()) return res.status(503).send('calendar not configured');
+  const email = (req.query.email || 'ryanlane0331@gmail.com').trim();
+  const role = (req.query.role || 'writer').trim();
+  try {
+    await gfetch(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(process.env.GOOGLE_CALENDAR_ID)}/acl`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role, scope: { type: 'user', value: email } })
+    });
+    res.send(`Done. The booking calendar is now shared with ${email} as ${role}. Next: sign into Google Calendar as ${email} (it will appear under "Other calendars"), then reload the dashboard Calendar tab.`);
+  } catch (e) { res.status(500).send('error: ' + e.message); }
+});
+
 // ---------------------------------------------------------------------------
 // Customer self-service: reschedule or cancel from a tokenized link in emails.
 // ---------------------------------------------------------------------------
