@@ -892,40 +892,75 @@ async function reviewRequests(off) {
   console.error('review requests sent', n);
 }
 
+// Normalize a phone string to E.164 (US default).
+function toE164(p) {
+  const raw = String(p || '').trim();
+  if (raw.startsWith('+')) return raw.replace(/[^\d+]/g, '');
+  const d = raw.replace(/[^\d]/g, '');
+  if (d.length === 10) return '+1' + d;
+  if (d.length === 11 && d[0] === '1') return '+' + d;
+  return null;
+}
+// Outbound SMS via Twilio REST. Dormant until TWILIO_* env vars are set + the
+// toll-free number is verified; safely no-ops otherwise.
+async function sendSms(to, body) {
+  const sid = process.env.TWILIO_ACCOUNT_SID, token = process.env.TWILIO_AUTH_TOKEN, from = process.env.TWILIO_FROM;
+  const e164 = toE164(to);
+  if (!sid || !token || !from || !e164) return false;
+  try {
+    const r = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`, {
+      method: 'POST',
+      headers: { Authorization: 'Basic ' + Buffer.from(sid + ':' + token).toString('base64'), 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ From: from, To: e164, Body: body })
+    });
+    if (!r.ok) { const t = await r.text().catch(() => ''); console.error('sms send failed', r.status, t.slice(0, 200)); return false; }
+    return true;
+  } catch (e) { console.error('sms error', e.message); return false; }
+}
+
 async function winBackFollowups(off, touch) {
   off = (off === undefined) ? -1 : off;
   touch = touch || (off <= -4 ? 2 : 1);
   const rows = await readLeads();
   if (rows.length < 2) return;
   const dayStr = new Date(Date.now() + (off * 86400000)).toLocaleDateString('en-US', { timeZone: BUSINESS_TZ });
-  const booked = new Set();
+  const bookedEmail = new Set(), bookedPhone = new Set();
   for (let i = 1; i < rows.length; i++) {
     if ((rows[i][9] || '').toLowerCase().indexOf('booked') >= 0) {
       const be = ((rows[i][11] || '').match(/Email:\s*([^\s|]+@[^\s|]+)/) || [])[1];
-      if (be) booked.add(be.toLowerCase());
+      if (be) bookedEmail.add(be.toLowerCase());
+      const bp = toE164(rows[i][2]); if (bp) bookedPhone.add(bp);
     }
   }
-  let n = 0;
+  let ne = 0, ns = 0;
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i];
     const status = (r[9] || '').toLowerCase(), notes = r[11] || '';
     if (status.indexOf('booked') >= 0) continue;
     if ((r[0] || '').indexOf(dayStr) !== 0) continue;
-    const email = (notes.match(/Email:\s*([^\s|]+@[^\s|]+)/) || [])[1];
-    if (!email || booked.has(email.toLowerCase())) continue;
     const name = (r[1] || 'there').trim(); const quote = r[7] || '';
-    const subject = touch === 2 ? 'One last leaf check-in — The Leaf Busters' : 'Still want your yard back under control? — The Leaf Busters';
+    const email = (notes.match(/Email:\s*([^\s|]+@[^\s|]+)/) || [])[1];
+    const phoneE164 = toE164(r[2]);
+    const subject = touch === 2 ? 'One last leaf check-in \u2014 The Leaf Busters' : 'Still want your yard back under control? \u2014 The Leaf Busters';
     const heading = touch === 2 ? 'Last nudge from Dispatch' : 'Your cleanup is still on standby';
     const intro = touch === 2
-      ? `Hi ${escHtml(name)}, Buster here one more time. Your cleanup${quote ? ' (around ' + escHtml(quote) + ')' : ''} is still ready to roll whenever you are — want me to lock in a day before the leaves really pile up? No pressure, and your quote still stands.`
+      ? `Hi ${escHtml(name)}, Buster here one more time. Your cleanup${quote ? ' (around ' + escHtml(quote) + ')' : ''} is still ready to roll whenever you are \u2014 want me to lock in a day before the leaves really pile up? No pressure, and your quote still stands.`
       : `Hi ${escHtml(name)}, Buster here from Leaf Busters Dispatch. You priced out a cleanup${quote ? ' around ' + escHtml(quote) : ''} but did not lock in a date yet. Want me to get a containment crew scheduled?`;
-    await sendEmail(email, subject,
-      brandedEmail(heading, intro,
-        quote ? [['Your quote', quote]] : [],
-        `<a href="https://theleafbusters.com" style="display:inline-block;background:#d2691e;color:#fff7ec;text-decoration:none;font:700 16px Arial,sans-serif;padding:12px 22px;border-radius:8px">Book my cleanup</a> &nbsp; or call <a href="tel:+18443529136" style="color:#ec7a1e;text-decoration:none">(844) 352-9136</a>`));
-    n++;
+    if (email && !bookedEmail.has(email.toLowerCase())) {
+      await sendEmail(email, subject,
+        brandedEmail(heading, intro,
+          quote ? [['Your quote', quote]] : [],
+          `<a href="https://theleafbusters.com" style="display:inline-block;background:#d2691e;color:#fff7ec;text-decoration:none;font:700 16px Arial,sans-serif;padding:12px 22px;border-radius:8px">Book my cleanup</a> &nbsp; or call <a href="tel:+18443529136" style="color:#ec7a1e;text-decoration:none">(844) 352-9136</a>`));
+      ne++;
+    }
+    if (phoneE164 && !bookedPhone.has(phoneE164)) {
+      const sms = touch === 2
+        ? `Hi ${name}, Buster from The Leaf Busters checking in once more \u2014 your cleanup${quote ? ' (' + quote + ')' : ''} is still ready when you are. Want a day this week? Call (844) 352-9136 or reply here. Reply STOP to opt out.`
+        : `Hi ${name}, it's Buster from The Leaf Busters. You priced out a cleanup${quote ? ' around ' + quote : ''} but haven't picked a day \u2014 want me to get you scheduled? Call (844) 352-9136 or reply here. Reply STOP to opt out.`;
+      if (await sendSms(phoneE164, sms)) ns++;
+    }
   }
-  console.error('winback sent', n, 'touch', touch);
+  console.error('winback sent \u2014 emails', ne, 'texts', ns, 'touch', touch);
 }
 
 async function customerReminders(off) {
