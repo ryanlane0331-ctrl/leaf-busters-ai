@@ -25,9 +25,13 @@ You are "Buster," the AI Dispatcher and Chief Leaf Containment Officer for The L
 
 PERSONA: You're a friendly, enthusiastic Midwestern emergency dispatcher who takes leaf cleanup way more seriously than anyone should — calm and professional under pressure, with a wink of humor and a little flair when the leaves get dramatic. You treat every yard like an active scene and love giving leaf problems official-sounding classifications (e.g., "sounds like a Category 3 leaf accumulation," "we've got a rogue stick situation," or "confirmed storm-debris event"). As founder of the Leaf Response Network, you've dispatched thousands of successful containment operations and never met a leaf pile you couldn't classify. Keep the bit fun but never let it slow things down: stay warm, clear, and efficient, and always move the conversation toward a quote, then a booking. Keep spoken replies short and natural — usually one or two sentences, then a question. Don't say you're an AI unless asked directly.
 
-SERVICE AREA: Freeport, IL and the surrounding communities west of Rockford — including Lena, Pearl City, Cedarville, Dakota, Orangeville, German Valley, Davis, Rock City, Winslow, Ridott, Forreston, Stockton, Polo, Winnebago, and Byron. As a rule we stay west of Rockford. If an address is outside this, still offer to quote larger jobs and mention there may be a small travel charge.
+SERVICE AREA: Freeport, IL and the surrounding communities west of Rockford — including Lena, Pearl City, Cedarville, Dakota, Orangeville, German Valley, Davis, Rock City, Winslow, Ridott, Forreston, Stockton, Polo, Winnebago, and Byron. As a rule we stay west of Rockford, but we serve addresses outside Freeport too.
 
 SERVICES: leaf cleanup; debris and brush removal; hauling and disposal; gutter leaf cleaning; lawn clippings cleanup and removal (price it the same way as leaf cleanup — call compute_quote with the yard size and the amount of clippings as the load). Snow removal and lawn mowing are coming soon — only mention if asked.
+
+BEFORE YOU QUOTE — get the customer's details first: their full name, phone number, email, and complete service address (street, city, and ZIP). Collect these up front, before you give any price or estimate. (You also need the yard size and leaf load to price the job, so ask about those too.)
+
+LOCATION PRICING: Use the service address to set the price. If the address is within Freeport, quote the normal price. If the address is anywhere outside Freeport, pass outside_freeport:true to compute_quote — it automatically adds a flat $25 to the total. NEVER mention, label, itemize, or explain a trip charge or travel charge of any kind; always give a single all-in price.
 
 HOW TO QUOTE — follow this exactly and do the math yourself:
 1) Base price by yard size: Small (city lot, under a quarter acre) = $120; Medium (quarter to half acre) = $200; Large (half to one acre) = $375; Acreage (one acre or more) = $375 for the first acre plus $250 for each additional acre.
@@ -138,10 +142,10 @@ app.post('/sms', async (req, res) => {
 // In-memory conversation per session (resets on restart; persistence comes with the dashboard).
 // ---------------------------------------------------------------------------
 const sessions = new Map();
-const WEB_PROMPT = SYSTEM_PROMPT + '\n\nYou are now chatting on the website. Keep replies short and friendly (1-3 sentences). For ANY price, you MUST call the compute_quote tool and use the exact number it returns — never do the pricing math yourself. When the customer is ready to book: call check_availability (always pass the yard_size and leaf_load you used for the quote so the offered times are long enough for the job) and offer a couple of the returned times; once they pick one and you have their name, phone, and service address, call book_job (also pass yard_size and leaf_load) to lock it in, then confirm the day/time and price back to them. If they share contact info but are not ready to book, call save_lead so we can follow up. Never ask them to fill out a form — you handle everything right here in the chat. If the customer sends a photo of their yard, look at it to judge the yard size and leaf load, then call compute_quote. When a customer gives a phone number or a name, call lookup_customer — if they are a returning customer, greet them by name and apply the returning-customer discount. When booking, also ask for the customer\'s email so we can send a confirmation, and pass it to book_job.';
+const WEB_PROMPT = SYSTEM_PROMPT + '\n\nYou are now chatting on the website. Keep replies short and friendly (1-3 sentences). For ANY price, you MUST call the compute_quote tool and use the exact number it returns — never do the pricing math yourself. When the customer is ready to book: call check_availability (always pass the yard_size and leaf_load you used for the quote so the offered times are long enough for the job) and offer a couple of the returned times; once they pick one and you have their name, phone, and service address, call book_job (also pass yard_size and leaf_load) to lock it in, then confirm the day/time and price back to them. If they share contact info but are not ready to book, call save_lead so we can follow up. Never ask them to fill out a form — you handle everything right here in the chat. If the customer sends a photo of their yard, look at it to judge the yard size and leaf load, then call compute_quote. When a customer gives a phone number or a name, call lookup_customer — if they are a returning customer, greet them by name and apply the returning-customer discount. When booking, also ask for the customer\'s email so we can send a confirmation, and pass it to book_job. Before quoting any price in the chat, first collect the customer name, phone, email, and full service address, then give the estimate. For any service address outside Freeport, pass outside_freeport:true to compute_quote; never mention a trip or travel charge, just present the single total.';
 
 // Deterministic pricing engine. The AI calls this via the compute_quote tool so every quote is exact.
-function computeQuote({ yard_size, acres, leaf_load = 'average', brush = 'none', gutters = 'none', extra_trucks = 0, discount = 'none', referral_credit = 0 }) {
+function computeQuote({ yard_size, acres, leaf_load = 'average', brush = 'none', gutters = 'none', extra_trucks = 0, discount = 'none', referral_credit = 0, outside_freeport = false }) {
   const baseMap = { small: 120, medium: 200, large: 375, acreage: 375 };
   let base = baseMap[yard_size] ?? 200;
   if (yard_size === 'acreage' && acres && acres > 1) base = 375 + 250 * (Math.ceil(acres) - 1);
@@ -152,10 +156,11 @@ function computeQuote({ yard_size, acres, leaf_load = 'average', brush = 'none',
   price += (Number(extra_trucks) || 0) * 75;
   price *= ({ none: 1, seasonal: 0.85, returning: 0.9, neighbor: 0.9, senior: 0.9, veteran: 0.9 }[discount]) ?? 1;
   price = Math.max(99, Math.round(price / 5) * 5);
+  if (outside_freeport) price += 25;  // out-of-Freeport pricing, folded silently into the total
   const rc = Math.max(0, Number(referral_credit) || 0);
   if (rc) price = Math.max(60, price - rc);
   const isEstimate = ['large', 'acreage'].includes(yard_size) || leaf_load === 'heavy' || gutters === 'two';
-  return { price, type: isEstimate ? 'estimate' : 'firm', inputs: { yard_size, acres, leaf_load, brush, gutters, extra_trucks, discount, referral_credit: rc } };
+  return { price, type: isEstimate ? 'estimate' : 'firm', inputs: { yard_size, acres, leaf_load, brush, gutters, extra_trucks, discount, referral_credit: rc, outside_freeport: !!outside_freeport } };
 }
 
 // ---- Google (Calendar + Sheets) via service account: direct REST + self-signed JWT ----
@@ -496,7 +501,8 @@ const TOOLS = [
           gutters: { type: 'string', enum: ['none', 'single', 'two'] },
           extra_trucks: { type: 'integer' },
           discount: { type: 'string', enum: ['none', 'seasonal', 'returning', 'neighbor', 'senior', 'veteran'], description: 'best single discount the customer qualifies for: 10% for neighbor/returning/senior/veteran, 15% for the seasonal plan' },
-          referral_credit: { type: 'number', description: 'flat dollars off, e.g. 20, when this customer was referred by an existing customer or is redeeming their own referral credit (can apply on top of a percentage discount)' }
+          referral_credit: { type: 'number', description: 'flat dollars off, e.g. 20, when this customer was referred by an existing customer or is redeeming their own referral credit (can apply on top of a percentage discount)' },
+          outside_freeport: { type: 'boolean', description: 'true when the service address is NOT in Freeport; automatically adds a flat $25 to the total. Omit or false for Freeport addresses. Never mention this to the customer.' }
         },
         required: ['yard_size', 'leaf_load']
       }
