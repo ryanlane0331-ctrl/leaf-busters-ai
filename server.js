@@ -704,6 +704,30 @@ function renderDashboard(leads, events) {
     return `<tr><td>${esc(when)}</td><td>${esc(e.summary || '')}</td><td>${esc(e.location || '')}</td><td>${esc((e.description || '').replace(/\n/g, ' • '))}</td></tr>`;
   }).join('');
   const leadRows = rows.map(r => `<tr>${header.map((_, i) => `<td>${esc(r[i] || '')}</td>`).join('')}</tr>`).join('');
+
+  // Contacts: unique customers we have done work for (booked), for marketing.
+  const cmap = {};
+  for (let k = 1; k < leads.length; k++) {
+    const r = leads[k];
+    if ((r[9] || '').toLowerCase().indexOf('booked') < 0) continue;
+    const email = ((r[11] || '').match(/Email:\s*([^\s|]+@[^\s|]+)/) || [])[1] || '';
+    const phone = (r[2] || '').trim();
+    const name = (r[1] || '').trim();
+    const key = phone.replace(/[^0-9]/g, '') || email.toLowerCase() || name.toLowerCase();
+    if (!key) continue;
+    if (!cmap[key]) cmap[key] = { name: name, phone: phone, email: email, address: (r[3] || '').trim(), jobs: 0, last: r[0] || '' };
+    const c = cmap[key]; c.jobs++;
+    if (!c.name && name) c.name = name;
+    if (!c.email && email) c.email = email;
+    if (!c.address && r[3]) c.address = (r[3] || '').trim();
+    if (r[0]) c.last = r[0];
+  }
+  const contacts = Object.values(cmap);
+  const contactRows = contacts.map(c => `<tr><td>${esc(c.name)}</td><td>${esc(c.phone)}</td><td>${esc(c.email)}</td><td>${esc(c.address)}</td><td>${c.jobs}</td><td>${esc(c.last)}</td></tr>`).join('');
+  const emails = contacts.map(c => c.email).filter(Boolean);
+  const phones = contacts.map(c => c.phone).filter(Boolean);
+  const csv = ['Name,Phone,Email,Address,Jobs,Last service'].concat(contacts.map(c => [c.name, c.phone, c.email, c.address, c.jobs, c.last].map(x => `"${String(x == null ? '' : x).replace(/"/g, '""')}"`).join(','))).join('\n');
+
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Leaf Busters Dashboard</title>
 <style>body{font-family:system-ui,Arial,sans-serif;background:#100e0c;color:#f4eee0;margin:0;padding:24px}
 h1{font-size:22px;color:#ec7a1e;margin:0 0 4px}h2{font-size:17px;color:#ece0c4;margin:28px 0 10px}
@@ -712,14 +736,46 @@ table{width:100%;border-collapse:collapse;font-size:13px;background:#1b1714;bord
 th,td{padding:9px 11px;text-align:left;border-bottom:1px solid rgba(236,224,196,.12);vertical-align:top}
 th{background:#2f5233;color:#f3ede0;font-size:12px;text-transform:uppercase;letter-spacing:.5px}
 tr:hover td{background:rgba(210,105,30,.06)}.empty{color:#c9b896;padding:14px 0}
-.count{background:#d2691e;color:#fff7ec;border-radius:20px;padding:1px 9px;font-size:13px;margin-left:6px}</style></head>
+.count{background:#d2691e;color:#fff7ec;border-radius:20px;padding:1px 9px;font-size:13px;margin-left:6px}
+.tabs{display:flex;gap:8px;margin:18px 0 6px;flex-wrap:wrap}
+.tab{background:#1b1714;color:#c9b896;border:1px solid rgba(236,224,196,.2);padding:9px 16px;border-radius:8px;cursor:pointer;font-size:14px}
+.tab.active{background:#2f5233;color:#f3ede0;border-color:#2f5233}
+.exports{display:flex;gap:8px;margin:10px 0 14px;flex-wrap:wrap}
+.exports button{background:#d2691e;color:#fff7ec;border:0;padding:9px 15px;border-radius:8px;cursor:pointer;font-size:13px}
+.exports button:hover{background:#ec7a1e}</style></head>
 <body><h1>The Leaf Busters — Dashboard</h1><div class="sub">Live from your calendar &amp; leads sheet. Reload to refresh.</div>
-<h2>Upcoming bookings <span class="count">${events.length}</span></h2>
-${events.length ? `<table><tr><th>When</th><th>Job</th><th>Address</th><th>Details</th></tr>${evRows}</table>` : '<div class="empty">No upcoming bookings yet.</div>'}
-<h2>Leads &amp; quotes <span class="count">${rows.length}</span></h2>
-${rows.length ? `<table><tr>${header.map(h => `<th>${esc(h)}</th>`).join('')}</tr>${leadRows}</table>` : '<div class="empty">No leads captured yet.</div>'}
+<div class="tabs">
+  <button class="tab active" data-t="contacts">Contacts <span class="count">${contacts.length}</span></button>
+  <button class="tab" data-t="bookings">Upcoming <span class="count">${events.length}</span></button>
+  <button class="tab" data-t="leads">Leads &amp; quotes <span class="count">${rows.length}</span></button>
+</div>
+<section id="tab-contacts" class="panel">
+  <div class="sub">Everyone you’ve done work for — use these to send promotions. (Updates automatically as you book jobs.)</div>
+  <div class="exports">
+    <button onclick="copyText(EMAILS.join(', '),this)">Copy ${emails.length} emails</button>
+    <button onclick="copyText(PHONES.join(', '),this)">Copy ${phones.length} phone numbers</button>
+    <button onclick="downloadCsv()">Download CSV</button>
+  </div>
+  ${contacts.length ? `<table><tr><th>Name</th><th>Phone</th><th>Email</th><th>Address</th><th>Jobs</th><th>Last service</th></tr>${contactRows}</table>` : '<div class="empty">No customers yet — this fills in automatically as you book and complete jobs.</div>'}
+</section>
+<section id="tab-bookings" class="panel" style="display:none">
+  ${events.length ? `<table><tr><th>When</th><th>Job</th><th>Address</th><th>Details</th></tr>${evRows}</table>` : '<div class="empty">No upcoming bookings yet.</div>'}
+</section>
+<section id="tab-leads" class="panel" style="display:none">
+  ${rows.length ? `<table><tr>${header.map(h => `<th>${esc(h)}</th>`).join('')}</tr>${leadRows}</table>` : '<div class="empty">No leads captured yet.</div>'}
+</section>
+<script>
+var EMAILS=${JSON.stringify(emails)},PHONES=${JSON.stringify(phones)},CSV=${JSON.stringify(csv)};
+document.querySelectorAll('.tab').forEach(function(b){b.onclick=function(){
+  document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('active');});b.classList.add('active');
+  document.querySelectorAll('.panel').forEach(function(p){p.style.display='none';});
+  document.getElementById('tab-'+b.getAttribute('data-t')).style.display='';};});
+function copyText(t,btn){if(!t){return;}navigator.clipboard.writeText(t).then(function(){var o=btn.textContent;btn.textContent='Copied!';setTimeout(function(){btn.textContent=o;},1200);});}
+function downloadCsv(){var a=document.createElement('a');a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(CSV);a.download='leaf-busters-contacts.csv';document.body.appendChild(a);a.click();a.remove();}
+</script>
 </body></html>`;
 }
+
 
 app.get('/dashboard', dashAuth, async (req, res) => {
   let leads = [], events = [];
