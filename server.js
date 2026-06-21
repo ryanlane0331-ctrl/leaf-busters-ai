@@ -892,10 +892,12 @@ async function reviewRequests(off) {
   console.error('review requests sent', n);
 }
 
-async function winBackFollowups(off) {
+async function winBackFollowups(off, touch) {
+  off = (off === undefined) ? -1 : off;
+  touch = touch || (off <= -4 ? 2 : 1);
   const rows = await readLeads();
   if (rows.length < 2) return;
-  const dayStr = new Date(Date.now() + ((off === undefined ? -1 : off) * 86400000)).toLocaleDateString('en-US', { timeZone: BUSINESS_TZ });
+  const dayStr = new Date(Date.now() + (off * 86400000)).toLocaleDateString('en-US', { timeZone: BUSINESS_TZ });
   const booked = new Set();
   for (let i = 1; i < rows.length; i++) {
     if ((rows[i][9] || '').toLowerCase().indexOf('booked') >= 0) {
@@ -912,13 +914,18 @@ async function winBackFollowups(off) {
     const email = (notes.match(/Email:\s*([^\s|]+@[^\s|]+)/) || [])[1];
     if (!email || booked.has(email.toLowerCase())) continue;
     const name = (r[1] || 'there').trim(); const quote = r[7] || '';
-    await sendEmail(email, 'Still want your yard back under control? — The Leaf Busters',
-      brandedEmail('Your cleanup is still on standby', `Hi ${escHtml(name)}, Buster here from Leaf Busters Dispatch. You priced out a cleanup${quote ? ' around ' + escHtml(quote) : ''} but didn’t lock in a date yet. Want me to get a containment crew scheduled?`,
+    const subject = touch === 2 ? 'One last leaf check-in — The Leaf Busters' : 'Still want your yard back under control? — The Leaf Busters';
+    const heading = touch === 2 ? 'Last nudge from Dispatch' : 'Your cleanup is still on standby';
+    const intro = touch === 2
+      ? `Hi ${escHtml(name)}, Buster here one more time. Your cleanup${quote ? ' (around ' + escHtml(quote) + ')' : ''} is still ready to roll whenever you are — want me to lock in a day before the leaves really pile up? No pressure, and your quote still stands.`
+      : `Hi ${escHtml(name)}, Buster here from Leaf Busters Dispatch. You priced out a cleanup${quote ? ' around ' + escHtml(quote) : ''} but did not lock in a date yet. Want me to get a containment crew scheduled?`;
+    await sendEmail(email, subject,
+      brandedEmail(heading, intro,
         quote ? [['Your quote', quote]] : [],
         `<a href="https://theleafbusters.com" style="display:inline-block;background:#d2691e;color:#fff7ec;text-decoration:none;font:700 16px Arial,sans-serif;padding:12px 22px;border-radius:8px">Book my cleanup</a> &nbsp; or call <a href="tel:+18443529136" style="color:#ec7a1e;text-decoration:none">(844) 352-9136</a>`));
     n++;
   }
-  console.error('winback sent', n);
+  console.error('winback sent', n, 'touch', touch);
 }
 
 async function customerReminders(off) {
@@ -943,7 +950,7 @@ setInterval(async () => {
     const { ymd: today, hour } = chiNow();
     if (hour === 6 && _ranBrief !== today) { _ranBrief = today; await dailyBriefing(0); }
     if (hour === 17 && _ranRem !== today) { _ranRem = today; await customerReminders(1); }
-    if (hour === 18 && _ranEve !== today) { _ranEve = today; await reviewRequests(-1); await winBackFollowups(-1); }
+    if (hour === 18 && _ranEve !== today) { _ranEve = today; await reviewRequests(-1); await winBackFollowups(-1, 1); await winBackFollowups(-4, 2); }
   } catch (e) { console.error('scheduler error', e.message); }
 }, 5 * 60 * 1000);
 
