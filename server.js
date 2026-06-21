@@ -70,8 +70,7 @@ app.use(express.urlencoded({ extended: false, limit: '12mb' }));
 app.use(express.json({ limit: '12mb' }));
 
 app.get('/', (req, res) => {
-res.type('html').send(fs.readFileSync('index.html','utf8'));});
-
+res.send('The Leaf Busters AI assistant is running.');});
 // Public base URL (used to embed the logo in emails). Override with PUBLIC_URL if the host changes.
 const PUBLIC_URL = (process.env.PUBLIC_URL || 'https://leaf-busters-ai.onrender.com').replace(/\/$/, '');
 let LOGO_BUF = null;
