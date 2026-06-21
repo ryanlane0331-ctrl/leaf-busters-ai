@@ -728,6 +728,8 @@ function renderDashboard(leads, events) {
   const phones = contacts.map(c => c.phone).filter(Boolean);
   const csv = ['Name,Phone,Email,Address,Jobs,Last service'].concat(contacts.map(c => [c.name, c.phone, c.email, c.address, c.jobs, c.last].map(x => `"${String(x == null ? '' : x).replace(/"/g, '""')}"`).join(','))).join('\n');
 
+  const calId = process.env.GOOGLE_CALENDAR_ID || '';
+  const calSrc = calId ? ('https://calendar.google.com/calendar/embed?src=' + encodeURIComponent(calId) + '&ctz=' + encodeURIComponent(BUSINESS_TZ)) : '';
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Leaf Busters Dashboard</title>
 <style>body{font-family:system-ui,Arial,sans-serif;background:#100e0c;color:#f4eee0;margin:0;padding:24px}
 h1{font-size:22px;color:#ec7a1e;margin:0 0 4px}h2{font-size:17px;color:#ece0c4;margin:28px 0 10px}
@@ -747,6 +749,7 @@ tr:hover td{background:rgba(210,105,30,.06)}.empty{color:#c9b896;padding:14px 0}
 <div class="tabs">
   <button class="tab active" data-t="contacts">Contacts <span class="count">${contacts.length}</span></button>
   <button class="tab" data-t="bookings">Upcoming <span class="count">${events.length}</span></button>
+  <button class="tab" data-t="calendar">Calendar</button>
   <button class="tab" data-t="leads">Leads &amp; quotes <span class="count">${rows.length}</span></button>
 </div>
 <section id="tab-contacts" class="panel">
@@ -760,6 +763,10 @@ tr:hover td{background:rgba(210,105,30,.06)}.empty{color:#c9b896;padding:14px 0}
 </section>
 <section id="tab-bookings" class="panel" style="display:none">
   ${events.length ? `<table><tr><th>When</th><th>Job</th><th>Address</th><th>Details</th></tr>${evRows}</table>` : '<div class="empty">No upcoming bookings yet.</div>'}
+</section>
+<section id="tab-calendar" class="panel" style="display:none">
+  <div class="sub">Your live booking calendar — the same one the assistant books into. <a href="https://calendar.google.com/calendar/r" target="_blank" rel="noopener" style="color:#ec7a1e">Open in Google Calendar &rarr;</a></div>
+  ${calSrc ? `<iframe src="${calSrc}" style="border:0;width:100%;height:640px;border-radius:10px;background:#fff" title="Booking calendar"></iframe>` : '<div class="empty">Calendar not configured.</div>'}
 </section>
 <section id="tab-leads" class="panel" style="display:none">
   ${rows.length ? `<table><tr>${header.map(h => `<th>${esc(h)}</th>`).join('')}</tr>${leadRows}</table>` : '<div class="empty">No leads captured yet.</div>'}
