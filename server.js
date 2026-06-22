@@ -319,8 +319,8 @@ function brandedEmail(heading, introHtml, rows, footerNote) {
   return `<!doctype html><html><body style="margin:0;padding:0;background:#100e0c">
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#100e0c"><tr><td align="center" style="padding:24px 12px">
     <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#1b1714;border:1px solid rgba(236,224,196,.14);border-radius:16px;overflow:hidden">
-      <tr><td align="center" style="background:#100e0c;padding:28px 20px 22px">
-        <img src="${PUBLIC_URL}/logo.jpg" width="190" alt="The Leaf Busters — Leaf Cleanup &amp; Removal" style="display:block;border:0;width:190px;max-width:72%;height:auto;margin:0 auto">
+      <tr><td align="center" style="background:#100e0c;padding:0;font-size:0;line-height:0">
+        <img src="${PUBLIC_URL}/logo.jpg" width="600" alt="The Leaf Busters — Leaf Cleanup &amp; Removal" style="display:block;border:0;width:100%;max-width:600px;height:auto;margin:0">
       </td></tr>
       <tr><td style="height:4px;background:#d2691e;font-size:0;line-height:0">&nbsp;</td></tr>
       <tr><td style="padding:26px 30px 4px">
@@ -354,7 +354,6 @@ async function sendBookingEmails(a, when, ctx) {
   if (a.email) {
     let actions = '';
     if (ctx.startISO && ctx.endISO) actions += btn(gcalLink('Leaf Busters cleanup', ctx.startISO, ctx.endISO, a.address, 'The Leaf Busters — ' + (a.service || 'Leaf cleanup')), 'Add to calendar');
-    if (a.address) actions += btn(mapLink(a.address), 'Directions');
     if (ctx.eventId) actions += btnGhost(manageUrl(ctx.eventId), 'Reschedule / cancel');
     const foot = actions + '<div style="margin-top:12px">No need to be home — just make sure the yard is accessible. Payment is due when the job\'s done. Weather reschedules are free.</div>';
     const atts = (ctx.startISO && ctx.endISO) ? [{ filename: 'leaf-busters-cleanup.ics', content: Buffer.from(icsContent(ctx.eventId || 'lb', 'Leaf Busters cleanup', ctx.startISO, ctx.endISO, a.address, a.service || 'Leaf cleanup')).toString('base64') }] : undefined;
@@ -408,7 +407,7 @@ async function bookSeason(a = {}) {
   rows.push(['Per visit', '$' + per, true]); rows.push(['Plan total', '$' + total]);
   if (process.env.ALERT_EMAIL) await sendEmail(process.env.ALERT_EMAIL, `New fall plan: ${a.name || 'Customer'} (${visits} visits)`, brandedEmail('New seasonal plan booked', `${escHtml(a.name || 'Customer')} signed up for a ${visits}-visit fall plan.`, rows.concat([['Name', a.name || ''], ['Phone', a.phone || ''], ['Address', a.address || '']]), a.address ? btnGhost(mapLink(a.address), 'View on map') : ''));
   if (a.email) {
-    const foot = (firstId ? btnGhost(manageUrl(firstId), 'Manage first visit') : '') + (a.address ? btn(mapLink(a.address), 'Directions') : '') + '<div style="margin-top:12px">You\'re saving 15% with the fall plan. No need to be home — just keep the yard accessible. Payment is due after each visit, and weather days reschedule free.</div>';
+    const foot = (firstId ? btnGhost(manageUrl(firstId), 'Manage first visit') : '') + '<div style="margin-top:12px">You\'re saving 15% with the fall plan. No need to be home — just keep the yard accessible. Payment is due after each visit, and weather days reschedule free.</div>';
     await sendEmail(a.email, 'Your Leaf Busters fall plan is booked', brandedEmail("Fall plan locked in! 🍂", `Hi ${escHtml(a.name || 'there')}, you're set with ${visits} cleanups this fall at 15% off each — here's the schedule:`, rows, foot));
   }
   return { booked: true, visits: visits, per_visit: per, total: total, dates: dates.map(d => d.when) };
@@ -1103,7 +1102,7 @@ async function customerReminders(off) {
   let n = 0;
   for (const e of ev) {
     if (!e.email) continue;
-    const foot = (e.location ? btn(mapLink(e.location), 'Directions') : '') + (e.id ? btnGhost(manageUrl(e.id), 'Reschedule / cancel') : '') +
+    const foot = (e.id ? btnGhost(manageUrl(e.id), 'Reschedule / cancel') : '') +
       '<div style="margin-top:12px">See you then! No need to be home — just keep the yard accessible. Payment is due when the job\'s done.</div>';
     await sendEmail(e.email, 'Reminder: your Leaf Busters cleanup is tomorrow',
       brandedEmail('Cleanup reminder 🍂', `Hi ${escHtml(e.name)}, friendly reminder from Leaf Busters Dispatch — Buck is scheduled to take care of your yard tomorrow.`,
