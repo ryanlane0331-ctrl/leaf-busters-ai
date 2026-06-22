@@ -279,11 +279,18 @@ async function sendEmail(to, subject, html, attachments) {
   const payload = { from, to: [to], subject, html };
   if (attachments && attachments.length) payload.attachments = attachments;
   try {
-    await fetch('https://api.resend.com/emails', {
+    const r = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
+    if (!r.ok) {
+      const body = await r.text().catch(() => '');
+      console.error(`EMAIL FAILED ${r.status} to=${to} subject="${subject}" ${body}`);
+    } else {
+      const data = await r.json().catch(() => ({}));
+      console.log(`email sent to=${to} subject="${subject}" id=${data.id || '?'}`);
+    }
   } catch (e) { console.error('email error', e.message); }
 }
 
