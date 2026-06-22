@@ -320,7 +320,7 @@ function brandedEmail(heading, introHtml, rows, footerNote) {
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#100e0c"><tr><td align="center" style="padding:24px 12px">
     <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#1b1714;border:1px solid rgba(236,224,196,.14);border-radius:16px;overflow:hidden">
       <tr><td align="center" style="background:#100e0c;padding:0;font-size:0;line-height:0">
-        <img src="${PUBLIC_URL}/logo.jpg" width="600" alt="The Leaf Busters — Leaf Cleanup &amp; Removal" style="display:block;border:0;width:100%;max-width:600px;height:auto;margin:0">
+        <img src="${PUBLIC_URL}/logo.jpg?v=2" width="600" alt="The Leaf Busters — Leaf Cleanup &amp; Removal" style="display:block;border:0;width:100%;max-width:600px;height:auto;margin:0">
       </td></tr>
       <tr><td style="height:4px;background:#d2691e;font-size:0;line-height:0">&nbsp;</td></tr>
       <tr><td style="padding:26px 30px 4px">
@@ -1163,7 +1163,7 @@ function managePage(title, bodyHtml) {
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title} — The Leaf Busters</title></head>
   <body style="margin:0;background:#100e0c;font-family:Arial,Helvetica,sans-serif;color:#f4eee0">
   <div style="max-width:560px;margin:0 auto;padding:34px 18px">
-    <div style="text-align:center;margin-bottom:18px"><img src="${PUBLIC_URL}/logo.jpg" width="160" alt="The Leaf Busters" style="width:160px;max-width:62%"></div>
+    <div style="text-align:center;margin-bottom:18px"><img src="${PUBLIC_URL}/logo.jpg?v=2" width="160" alt="The Leaf Busters" style="width:160px;max-width:62%"></div>
     <div style="background:#1b1714;border:1px solid rgba(236,224,196,.15);border-radius:16px;padding:26px 22px">${bodyHtml}</div>
     <div style="text-align:center;color:#8a6a3f;font-size:12px;margin-top:16px">theleafbusters.com &bull; (844) 352-9136</div>
   </div></body></html>`;
